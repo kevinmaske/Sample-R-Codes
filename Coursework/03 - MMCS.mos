@@ -1,0 +1,204 @@
+model MO_FULLMODEL
+	uses "mmxprs"
+	
+	declarations
+		product: set of string
+		crude: set of string
+		intermediate: set of string
+		cracked: set of string
+		
+		price, min_octane, min_prod: array(product) of real
+		crude_price, crude_limit: array(crude) of real
+		intermediate_octane: array(intermediate) of real
+		cracked_octane: array(cracked) of real
+		
+		distill_yield: array(crude, intermediate) of real
+		crack_yield: array(cracked, intermediate) of real
+		
+		distill_cost, distill_limit, crack_cost, crack_limit: real
+		
+		produce: array(product) of mpvar
+		buy_crude: array(crude) of mpvar
+		distill,to_crack: array(intermediate) of mpvar
+		crack: array(cracked) of mpvar
+		used_int: array(product, intermediate) of mpvar
+		used_crack: array(product, cracked) of mpvar
+	end-declarations
+	
+	initializations from "MO_full3.dat"
+		product crude intermediate cracked
+		price min_octane min_prod
+		crude_price crude_limit
+		intermediate_octane
+		cracked_octane
+		distill_yield
+		crack_yield
+		distill_cost distill_limit crack_cost crack_limit
+	end-initializations
+	
+	forward procedure Display_Constraint(con: linctr) 
+	forward procedure Display_RC(x: mpvar)
+	
+	!!! Objective function
+	!Total sales - cost of crude and distillation - cost of cracking
+	profit := sum(p in product) price(p)*produce(p) - sum(c in crude) (crude_price(c)+distill_cost)*buy_crude(c) - sum(i in intermediate) crack_cost*to_crack(i)
+		 
+	!!! CONSTRAINTS
+	
+	! Average octane, linearized
+	forall(p in product) do
+		minimum_octane(p) := sum(i in intermediate) used_int(p,i)*intermediate_octane(i) + sum(c in cracked) used_crack(p, c)*cracked_octane(c) >= produce(p)*min_octane(p)
+	end-do
+	
+	! Barrel buying limit
+	forall(c in crude) do
+		max_crude_bought(c) := buy_crude(c) <= crude_limit(c)
+	end-do
+	
+	! Distillation limit; the same as limiting total number of barrels per day
+	max_distillation := sum(c in crude) buy_crude(c) <= distill_limit
+	
+	! Definition of the DV distill as the sum of all of that intermediate distilled from the barrels
+	forall(i in intermediate) do
+		amount_distilled(i) := distill(i) = sum(c in crude) buy_crude(c)*distill_yield(c,i)
+	end-do
+	
+	! Amount cracked cannot exceed amount distilled less amount used. This, in general, makes sure we never exceed
+	! the total amount obtained from the barrels for each intermediate.
+	forall(i in intermediate) do
+		amount_cracked(i) := to_crack(i) <= distill(i) - sum(p in product) used_int(p, i)
+	end-do
+	
+	! naphtha can't be cracked
+	no_naphtha_crack := to_crack(intermediate(3)) = 0
+	
+	! Total crack limit
+	limit_crack := sum(i in intermediate) to_crack(i) <= crack_limit
+	
+	! Definition of yield from cracked
+	forall(k in cracked) do
+		cracked_output(k) := crack(k) = sum(i in intermediate) crack_yield(k,i)*to_crack(i)
+	end-do
+	
+	! Used crack is less than total cracked
+	forall(k in cracked) do
+		cracked_used(k) := sum(p in product) used_crack(p,k) <= crack(k)
+	end-do
+	
+	! Total amount of product is the sum of all intermediates
+	forall(p in product) do
+		total_produced(p) := produce(p) = sum(i in intermediate) used_int(p,i) + sum(c in cracked) used_crack(p, c)
+	end-do
+	
+	! Minimum production
+	forall(p in product) do
+		minimum_production(p) := produce(p) >= min_prod(p)
+	end-do
+	
+	! No naphtha in Heating Oil
+	naphtha_heatingoil := used_int(product(3), intermediate(3)) = 0
+	
+	! Distilled oil can't be used for gasoline or jetfuel
+	forall(p,i in 1..2) do
+		distilled_unusable(product(p),intermediate(i)) := used_int(product(p), intermediate(i)) = 0
+	end-do
+	
+	! No crack in heating oil
+	forall(k in cracked) do
+		none_in_HO(k) := used_crack(product(3), k) = 0
+	end-do
+	
+	! PERFORM OPTIMIZATION !
+	maximize(profit)
+
+	!Display Solution
+	writeln("Optimal production plan is: ")
+	writeln
+	forall(p in product) do
+		writeln(strfmt(p, 11), ": ", getsol(produce(p)), " barrels.")
+	end-do
+	writeln
+	writeln("Total profit is ", getobjval, ".")
+	writeln
+	writeln
+	
+	!Run through analysis of major constraints
+	writeln("DUAL ANALYSIS:")
+	writeln
+	
+	forall(c in crude) do
+		writeln("Maximum barrels of ", c, " available:")
+		Display_Constraint(max_crude_bought(c))
+	end-do
+	
+	writeln("Maximum barrels distilled:")
+	Display_Constraint(max_distillation)
+	writeln
+	
+	writeln("Maximum barrels cracked:")
+	Display_Constraint(limit_crack)
+	writeln
+
+	writeln
+	forall(i in intermediate) do
+		writeln("Amount of ", i, " available:")
+		Display_Constraint(amount_distilled(i))
+	end-do
+	
+	writeln
+	forall(k in cracked) do
+		writeln("Amount of ", k, " used:")
+		Display_Constraint(cracked_used(k))
+	end-do
+	
+	writeln
+	forall(p in product) do
+		writeln("Minimum barrels produced of ", p, ":")
+		Display_Constraint(minimum_production(p))
+	end-do
+	
+	! REDUCED COST ANALYSIS !
+	writeln
+	writeln("REDUCED COST ANALYSIS")
+	writeln
+	
+	forall(p in product) do
+		writeln("Price of ", p, ":")
+		Display_RC(produce(p))
+	end-do
+	
+	forall(c in crude) do
+		writeln("Price of ", c, ":")
+		Display_RC(buy_crude(c))
+	end-do
+	
+	forall(i in intermediate) do
+		writeln("Price of cracking a barrel of ", i, ":")
+		Display_RC(to_crack(i))
+	end-do
+	
+	
+
+	! Displays either slack or dual and interval, depending on value of slack.
+	! Was not able to find a way to incorporate constraint name,
+	! so they were just printed explicitly.
+	procedure Display_Constraint(con: linctr)
+		if(abs(getslack(con))<0.001) then
+			writeln("Dual variable: ", getdual(con), ".")
+			writeln("Holds for: (", getrange(XPRS_LOACT, con), ", ", getrange(XPRS_UPACT, con), ").")
+			writeln
+		else
+			writeln("Slack: ", getslack(con))
+			writeln
+		end-if
+	end-procedure
+	
+	! Displays the range for the coefficient of a DV such that
+	! the solution given will remain optimal
+	procedure Display_RC(x: mpvar)
+		writeln("Solution is stationary in (", getrange(XPRS_UCOST, x), ", ", getrange(XPRS_LCOST, x), ").")
+		writeln
+	end-procedure
+			
+end-model
+	

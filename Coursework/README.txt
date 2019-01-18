@@ -1,0 +1,1 @@
+This folder contains samples of codes that I've written in the past related to coursework. The codes come from different classes and different assignments/evaluations. All but one of them are written in R; 03-MMCS is written in MOSEL.
