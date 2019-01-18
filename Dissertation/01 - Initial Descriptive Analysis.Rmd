@@ -1,0 +1,2530 @@
+---
+title: "Dynamic Data Descriptive Analysis"
+author: "Kevin Maske"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+      code_folding: hide
+      toc: true
+      toc_float: 
+        collapsed: false
+      number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# install.packages('hexbin')
+# install.packages('gridExtra')
+
+library(tidyverse)
+library(data.table)
+library(lattice)
+library(RColorBrewer)
+library(hexbin)
+
+
+rf <- colorRampPalette(rev(brewer.pal(9, "BuPu")))
+```
+
+# Introduction
+
+While we wait for further input on how data will be granulated and the cohort be filtered, we look at the data as we have it, and try to study general behaviors and outliers. We hope, by the end of this, to be able to determine outliers based on the standards given in Maria's previous study, as well as look at potential imputation methods should the need arise.
+
+```{r DataLoad}
+
+data.path = "D:/DISSERTATION ACTION/RAW DATA (PREPROCESSED)/Dynamic Data"
+setwd(data.path)
+
+load("DDP2_Midway.RData")
+
+# Forgot to save these into the file
+N <- nrow(R_Cohort)
+SubjID <- unique(R_Cohort$subject_id.x)
+
+
+```
+
+The cohort we'll be looking at is the "Reduced Cohort" described in DDP2; that is, only subjets who had any measurements at all for all 6 remaining variables (HR, O2S, RR, TEMP, DBP, SBP) are included (In addition to the previous criteria used for static cohort building). **N = 36089**
+
+```{r Binner}
+# Place this here to overwrite the outdated "Binner" saved in .Rdata
+# prefer this over GetCohort
+Binner <- function(cohortlist, granulation=1, lenient = FALSE, maxhrs=96, indiv = FALSE){
+  if(granulation > 1){  # bin the subject lists
+    binned <- list()
+    for(i in 1:(maxhrs/granulation)){
+      low_ind <- ((i-1)*granulation + 1)
+      up_ind <- (i*granulation)
+      binned[[i]] <- Reduce(union, cohortlist$subjects[c(low_ind:up_ind)])
+    } 
+  } else {
+    binned <- cohortlist$subjects[c(1:maxhrs)]
+  }
+  
+  if(indiv == TRUE){
+    return(binned)
+  }
+  
+  cohort_binned <- list()
+  cohort_binned[[1]] <- binned[[1]]
+  
+  if(lenient == TRUE){
+    cohort_binned[[2]] <- union(binned[[2]], binned[[1]])
+    for(j in 3:length(binned)){
+      cohort_binned[[j]] <- intersect(binned[[j]],
+                                   union(cohort_binned[[j-1]], cohort_binned[[j-2]]))
+    }
+  } else {
+    for(j in 2:length(binned)){
+      cohort_binned[[j]] <- Reduce(intersect, binned[c(1:j)])
+    }
+  }
+   
+  if(indiv == FALSE){
+    return(cohort_binned)
+  }
+
+  
+}
+
+```
+
+# Descriptive Analysis
+
+Note that in Maria's paper, she produced a table summarizing the approach they used for determining outliers. The table is presened below:
+
+|        | Domain knowledge       | Medical guidelines     | Johnson et al (Github) | Statistical approach   |
+|:-------|:----------------------:|:----------------------:|:----------------------:|:----------------------:|
+|HR      | 200/40 | 252/0 | 300/0 | 257/22 |
+|SBP     | 250/50 | 502/0 | 400/0 | 341/33 |
+|DBP     | 160/0  | 671/0 | 300/0 | 308/5 |
+|RR      | 40/10 | 4084/0 | 70/0  | 91/2   |
+|TEMP    | 50/24 |  |   |    50/27|
+|SpO2    | 100/40 | 11751/0 | 100/0 | 132/70 |
+|WBC     |        |     |    | 30/0 |
+
+
+## Heart Rate
+
+As always, the first variable we consider is Heart Rate. For each variable, we hope to learn the following things:
+
+1. General Behaviour over time
+2. Presence of outliers
+3. Difference in behavior based on outcome
+
+The following tools will be used to facilitate such an analysis:
+
+1. Hexbin of all observations vs the time in ICU they were observed (plot() is too slow)
+2. Box plots per hour of observations
+3. Plots that discriminate between those who died and those who didn't die
+
+We first take a very general look at the data spread using a Hexbin. *For the next analyses, we'll limit to first 96 hours because otherwise we just get a bunch of stragglers that reach up til 3000 hours which isn't that interesting.*
+
+```{r}
+R_HR_lim <- filter(R_HR, time < 96, time >= 0)  # remove "invalid" times
+hexbin(R_HR_lim$time, R_HR_lim$valuenum) %>% plot(main = "Hexmap of heart rates over time",
+                                                  xlab = "Hour", ylab = "Heart Rate",
+                                                  legend = 1.2, lcex = 0.7)
+```
+
+Right off the bat, we already have a clear outlier in that single lone point well above 80000. There's no real question that this is an invalid observation - one that's quite impossible to achieve, so we remove it from further analysis. We use the limits Maria determined using the statistical approach described in the table presented at the start of the section (Figures were taken using box-cox methods). In this case, figures inside **[22, 257]** will be considered valid.
+
+```{r}
+R_HR_lim <- filter(R_HR_lim, valuenum <= 257, valuenum >= 22)  # remove "invalid" 80k HR
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_HR_lim,
+           aspect = 1,
+           xlab = "Hour", ylab = "HR",
+           main = "HR Observation Density",
+           xbins = 96, colramp = rf)
+
+
+```
+
+**Adding lines via abline and hexVP.abline are proving problematic. Alternative online was to use panel commands from lattice**.
+
+The hexmap above has the brightest (white) parts describing values for which there were most observations, while the darkening to violet signified less and less observations. There's what seems to be almost a straigt area in the middle that is consistently brighter than the rest - maybe this is indication that we can look at some sort of consant heart rate as an overall mean? Note: the counts in the legend represent the total counts over all periods of time.
+
+A look: how has sample size changed after removing the outliers? Previously, there were **36,089** subjects included in each dataset. After removing the invalid times (time < 0, time > 96), and "invalid values" (HR > 257, HR < 22), the remaining sample total subject sample size is **35,961**.
+
+```{r HRnewsample, results = 'hide'}
+R_HR_lim$icustay_id %>% unique %>% length
+# 35,961
+```
+
+```{r}
+boxplot(valuenum ~ hour,
+        data = R_HR_lim,
+        main = "Box Plots per Hour",
+        xlab = "Hour", ylab = "HR")
+```
+
+Notice that it looks generally similar to the hex plot (expected), but the box and whisker plot is able to point out somethings, at least based on visual inspection. Notice that for all the blocks, the inner quartile remains generally the same; further, the thick line in the center of the box plot (indicating median) remains, generally straight. One particular thing to note however is that we always have to recall that each boxplot has a differentn number of samples (not all patients have measurements for every segment, some patients were measured multiple times in a single hour - we'll deal with this later on). We try plotting the sample mean of each hour, along with a confidence interval (We appeal to the central limit theorem: that within a single hour, each observation is independent (the only issue with this is multiple observations from a single patient) and identically distributed) using a 1.96 multiplier to the sd (95% two-tailed normal CI).
+
+```{r}
+HR_hourly_summary <- R_HR_lim %>% group_by(hour) %>% summarise(mean = mean(valuenum),
+                                                               stdev = sd(valuenum),
+                                                               up_CI = mean + 1.96*stdev,
+                                                               low_CI = mean - 1.96*stdev)
+
+
+with(HR_hourly_summary,
+     plot(hour, mean, type = "l",
+          main = "Hourly Means of HR",
+          xlim = c(0, 96), ylim = c(22, 257),
+          xlab = "Hour", ylab = "Mean HR"))
+
+with(HR_hourly_summary,
+     polygon(c(hour, rev(hour)),
+             c(up_CI, rev(low_CI)),
+             col = "lightblue",
+             border = FALSE))
+with(HR_hourly_summary,
+     lines(hour, mean, lwd = 2))
+with(HR_hourly_summary,
+     lines(hour, low_CI, lty = 2, col = "red"))
+with(HR_hourly_summary,
+     lines(hour, up_CI, lty = 2, col = "red"))
+
+
+```
+
+Note that the vantage shown is based on what was considered as viable values ([22, 257]). It can be seen that the mean and confidence interval don't really move (in fact, the mean tends to stay around 81, and the sd remains around 18 throughout the entire time horizon in consideration).
+
+A particular point of interest here is the fact that due to the decreasing sample size as time went on, we would have expected larger variances in the latter hours. However, this did not seem to be the case. This may be due to the fact that without filter based on binning (this doesn't remove patients who had almost no entries in preceeding bins), the latter time bins might have higher sample sizes than we'd actually end up using in our final model building. As a final check with regards to the mean per hour of this, try to build a linear regression model such that heart rate ~ time. If the mean is, as we assert, constant throughout, then the time variable should **not** be significant.
+
+```{r HRRegression}
+
+HR_lm1 <- lm(valuenum ~ time, data = R_HR_lim)
+summary(HR_lm1)
+```
+
+Behold, the time variable had a wald test p-value of **0.853**, meaning it is not significant, further proving our assertion that the overall heart rate is stationary over time. What does this mean for us? This could be interpreted in a number of ways **confirm if these are valid readings**:
+
+Since heart rates taken at hour 1 and at hour 70 share the same expectation and (based on boxplots and confidence plots) standard deviation, can it be said that we can just choose one of those hours in our modelling (Of course, this isn't necessarily true; I'm trying to find a way to rationalize using earlier variables over later variables in order to increase our sample size. See DDP2.) Of course, this is only speaking in loose terms since in the end, the regression line takes into account the mean. We still have to look at the trajectory of individual measurements.
+
+
+### Stratified by Death
+
+We now try to look at the data when we consider the final outcome variables (death vs not dead). For our current purposes, we consider any recorded death as a case, even if they happened after dismissal. In particular, we zoom into the people who died within 96 hours of admission (even if they were discharged before they died). A total of 1,883 people died within 96 hours of admission.
+
+```{r}
+Death96 <- R_death %>% filter(deathtime_hours <= 96)
+nrow(Death96)
+# 1883
+```
+
+```{r}
+
+hexbinplot(valuenum ~ as.numeric(time),
+                          data = R_HR_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+                          aspect = 1,
+                          xlab = "Hour", ylab = "HR",
+                          main = "Not Dead",
+                          xbins = 96, colramp = rf)
+
+
+```
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_HR_lim %>% filter(icustay_id %in% Death96$icustay_id),
+           aspect = 1, ylim = c(0, 270),
+           xlab = "Hour", ylab = "HR",
+           main = "Dead",
+           xbins = 96, colramp = rf)
+```
+
+           
+```{r}
+par(mfrow=c(1,2))
+boxplot(valuenum ~ hour,
+        data = R_HR_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+        main = "Not Dead",
+        xlab = "Hour", ylab = "HR")
+boxplot(valuenum ~ hour,
+        data = R_HR_lim %>% filter(icustay_id %in% Death96$icustay_id),
+        main = "Dead",
+        xlab = "Hour", ylab = "HR")
+```
+
+Based purely on visual inspection, it can be seen that the general averag heart rate of those that did die seems to be higher than those that did not. Also, more noise is visible from the medians of the box plot for the dead than that of the not dead. This may well be due to the much lower sample size in each bin for the dead. As an initial analysis of the relationship between them, we try to build a regression model for the two groups, and use tests to determine if we can say that their intercepts are truly different. We expect that the time-variable will again, be insignificant.
+
+```{r, results = 'hide'}
+HR_lm_alive <- lm(valuenum ~ hour,
+                  data = R_HR_lim %>% filter(!icustay_id %in% Death96$icustay_id))
+HR_lm_dead <- lm(valuenum ~ hour,
+                 data = R_HR_lim %>% filter(icustay_id %in% Death96$icustay_id))
+
+summary(HR_lm_alive)
+summary(HR_lm_dead)
+```
+
+Interestingly enough, it seems wile the time variable remains insignificant for the living sample (p = 0.622), the time variable was significant for the dead sample (p = 0.0469). This seems to say, at least on a general level, that the behavior of heart rate across time differs between those who died and those who didn't. Alternatively, this may (again) be an artifact of comparatively low sample sizes. Let's check the sample sizes below.
+
+```{r HRDeathSampleCheck}
+HR_Sample_Table <- cbind(Alive = R_HR_lim %>%
+                           filter(!icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist,
+                         
+                         Dead = R_HR_lim %>%
+                           filter(icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id)))  %>% 
+                           select(count) %>% unlist,
+                         
+                         Total = R_HR_lim %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist) %>% as.data.frame()
+
+rownames(HR_Sample_Table) = seq(1,96)
+HR_Sample_Table
+  
+```
+
+```{r}
+plot(HR_Sample_Table$Alive, type = "l",
+     main = "HR Cohort Count", xlab = "Hour", ylab = "Subjects",
+     ylim = c(0, 20000))
+lines(HR_Sample_Table$Dead, col = "red")
+lines(HR_Sample_Table$Total, lty = 3)
+legend('topright', c("Did not die", "Died", "Total"),
+       lty = c(1,1,3), col = c("black", "red", "black"))
+```
+
+Thankfully, the sample size of each segment never drops below 200, lending even a small amount of credibility to the regression since it's not as if some time segments had only one measurement for dead people in some bins. Also, there's not really much need to test if the intercepts are different because the models themselves are already different (Dead = hour + intercept, Alive = intercept). At the very least, this seems to confirm the hypothesis that the heart rate of those who died behaved somewhat differently from those who didn't die, indicating some level of importance for later on in the analysis. Further, the fact that *time* seems to be important in the heart rate for those who are cases may indicate a need for longer periods of time in the data, contrary to what we said previously when looking only at the entire dataset.
+
+Before moving on, let's look at more plots that describe how the data behaves. We stratify based on death for all the other plots in this section.
+
+```{r}
+# mean heart rate and CI's
+with(R_HR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     plot(hour, mean, type = "l",
+          ylim = c(40, 160),
+          ylab = "Mean HR", xlab = "Hour",
+          main = "Average Heart Rate"))
+with(R_HR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     lines(hour, mean, col = "red"))
+
+# CI alive
+with(R_HR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+with(R_HR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+
+# CI dead
+with(R_HR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+with(R_HR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+
+
+
+
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+As described previously, the heart rates of those who died were noisier and tended to be higher than those that did not die. The 95% normal confidence intervals are denoted by the dotted line. It can be seen that, in general, the cases had a larger and more volatile confidence interval due to higher standard deviation (smaller sample size).
+
+```{r HRRanges}
+# Min and max
+with(R_HR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     plot(hour, max, type = "l",
+          ylim = c(0, 257),
+          ylab = "HR", xlab = "Hour",
+          main = "Extreme Heart Rates"))
+with(R_HR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "black"))
+
+
+with(R_HR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "red"))
+with(R_HR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     lines(hour, max, col = "red"))
+
+legend('topright', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+Note that of the two comparisons (min and max), it was in the maxima that there was more noise and difference between the two groups. Interestingly, the maximum for the control group was generally higher than that of the case group, which at first seems to contradict the previous hypothesis that those who died had higher Heart Rates. However, this may be reconciled by the fact that number of samples of heart rates which are in the average and lower zone are probably much higher for the control group than for the case group, allowing the average to get pulled down. So, if nothing else, this shows that  the spread of the observations for the control group seems to have a somewhat larger variance than that of the cases.
+
+
+## Respiration Rate
+
+We now perform an exploratory analysis of the respiration rate data, following generally the same procedure as above. We skip to the step after having removed invalid (timewise and value-wise data). The admissible values are those inside **[2, 91]**. The filtering reduced RR cohort to **35,808** admissions.
+
+```{r}
+R_RR_lim <- R_RR %>%  # Remove "invalids" and "outliers"
+  filter(time >= 0, time < 96,
+         valuenum >= 2, valuenum <= 91)  
+
+R_RR_lim$icustay_id %>% unique %>% length
+# 35,808 samples
+
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_RR_lim,
+           aspect = 1,
+           xlab = "Hour", ylab = "RR",
+           main = "RR Observation Density",
+           xbins = 96, colramp = rf)
+```
+
+Note the interesting "striped" pattern appearing. It seems to suggest that the observations were most common in alternating bands. What could that mean? Let's see how the hourly boxplots look.
+
+```{r}
+boxplot(valuenum ~ hour,
+        data = R_RR_lim,
+        main = "Boxplots per hour",
+        ylab = "RR", xlab = "Hour")
+```
+
+The boxplots suggest that the inner quantiles for all hours are aligned, again showing that it's possible that the overall mean remains the same across all time periods. Let's see how their confidence intervals and means vary over time.
+
+
+```{r}
+RR_hourly_summary <- R_RR_lim %>% group_by(hour) %>% summarise(mean = mean(valuenum),
+                                                               stdev = sd(valuenum),
+                                                               up_CI = mean + 1.96*stdev,
+                                                               low_CI = mean - 1.96*stdev)
+
+
+with(RR_hourly_summary,
+     plot(hour, mean, type = "l",
+          main = "Hourly Means of RR",
+          xlim = c(0, 96), ylim = c(2, 50),
+          xlab = "Hour", ylab = "Mean RR"))
+
+with(RR_hourly_summary,
+     polygon(c(hour, rev(hour)),
+             c(up_CI, rev(low_CI)),
+             col = "lightblue",
+             border = FALSE))
+with(RR_hourly_summary,
+     lines(hour, mean, lwd = 2))
+with(RR_hourly_summary,
+     lines(hour, low_CI, lty = 2, col = "red"))
+with(RR_hourly_summary,
+     lines(hour, up_CI, lty = 2, col = "red"))
+```
+
+This suggests a situation similar to what we had in HR, with a straight mean, and an overall consistent variance. Let's check this via regression.
+
+```{r}
+RR_lm1 <- lm(valuenum ~ time,
+             data = R_RR_lim)
+summary(RR_lm1)
+# time coefficient = -0.0008809, p = 6.07e-10
+```
+
+The regression gives the time variable a negative coefficient with p-value **6.07e-10**, making it highly significant. This indicates that the regression says that the mean RR is in fact, **not** simply stationary, but significantly related with time (even though the effect size may be small). Let's now check how the findings hold up when the data is stratified based on the outcome (death within 96 hours of admission).
+
+### Stratified
+
+```{r}
+
+hexbinplot(valuenum ~ as.numeric(time),
+                          data = R_RR_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+                          aspect = 1,
+                          xlab = "Hour", ylab = "RR",
+                          main = "Not Dead",
+                          xbins = 96, colramp = rf)
+```
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_RR_lim %>% filter(icustay_id %in% Death96$icustay_id),
+           aspect = 1, ylim = c(0, 91),
+           xlab = "Hour", ylab = "RR",
+           main = "Dead",
+           xbins = 96, colramp = rf)
+```
+
+Immediately we see a difference based on overall range - it seems the higher RR readings are more numerous in the Alive group than the dead group. Does this indicate that those who died generally had lower respiration rates?
+
+           
+```{r}
+par(mfrow=c(1,2))
+boxplot(valuenum ~ hour,
+        data = R_RR_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+        main = "Not Dead",
+        xlab = "Hour", ylab = "RR",
+        pch = ".")
+boxplot(valuenum ~ hour,
+        data = R_RR_lim %>% filter(icustay_id %in% Death96$icustay_id),
+        main = "Dead",
+        xlab = "Hour", ylab = "RR",
+        pch = ".")
+```
+
+Such a conclusion as the one presented above (dead -> lower RR) is not readilly shown by a boxplot. However, it seems the dead group had more scattered data, leading to bigger IQ's than the alive-group. Let's see if the regressions will result in different models, first by checking if time is significant in both, and then checking their intercepts if needed.
+
+
+```{r, results = 'hide'}
+RR_lm_alive <- lm(valuenum ~ time,
+                  data = R_RR_lim %>% filter(!icustay_id %in% Death96$icustay_id))
+RR_lm_dead <- lm(valuenum ~ time,
+                 data = R_RR_lim %>% filter(icustay_id %in% Death96$icustay_id))
+
+summary(RR_lm_alive)
+# -0.00101, p = 1.96e-12
+summary(RR_lm_dead)
+# 0.003940, p = 0.00011
+```
+
+While both models returned a coefficient for time significant at even the 0.01 confidence level, they are markedly different in the nature of the coefficient returned. The model for the control group indicated a negative relationship between time and RR (-0.0010) while the cases showed a positive relationship between time and RR (0.0039). This seems to indicate that not only is RR a possible good predictor, but we also need to take into account how RR evolves over time (increasing RR relates to death, decreasing RR relates to not-death). We check the corresponding sample sizes to see if there's any reason to be significantly doubtful of the results so far.
+
+```{r RRDeathSampleCheck}
+RR_Sample_Table <- cbind(Alive = R_RR_lim %>%
+                           filter(!icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist,
+                         
+                         Dead = R_RR_lim %>%
+                           filter(icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id)))  %>% 
+                           select(count) %>% unlist,
+                         
+                         Total = R_RR_lim %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist) %>% as.data.frame()
+
+rownames(RR_Sample_Table) = seq(1,96)
+RR_Sample_Table
+  
+```
+
+```{r}
+plot(RR_Sample_Table$Alive, type = "l",
+     main = "RR Cohort Count", xlab = "Hour", ylab = "Subjects",
+     ylim = c(0, 20000))
+lines(RR_Sample_Table$Dead, col = "red")
+lines(RR_Sample_Table$Total, lty = 3)
+legend('topright', c("Did not die", "Died", "Total"),
+       lty = c(1,1,3), col = c("black", "red", "black"))
+```
+
+Sample results are similar to HR; case samples never dropped below 200. Some other final plots.
+
+```{r}
+# mean heart rate and CI's
+with(R_RR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     plot(hour, mean, type = "l",
+          ylim = c(0, 40),
+          ylab = "Mean RR", xlab = "Hour",
+          main = "Average RR"))
+with(R_RR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     lines(hour, mean, col = "red"))
+
+# CI alive
+with(R_RR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+with(R_RR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+
+# CI dead
+with(R_RR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+with(R_RR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+
+
+
+
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+We see that there is some measure of similarity between the RR of those who died and those who didn't, though the cases clearly dominated the controls (in terms of mean). The confidence interval of the cases is also wider, especially on the top end, as expected.
+
+
+```{r RRRanges}
+# Min and max
+with(R_RR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     plot(hour, max, type = "l",
+          ylim = c(0, 100),
+          ylab = "RR", xlab = "Hour",
+          main = "Extreme RR"))
+with(R_RR_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "black"))
+
+
+with(R_RR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "red"))
+with(R_RR_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     lines(hour, max, col = "red"))
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+The same analysis (there was larger variance in control, but a bigger chunk of the samples from control were inside the inner parts) can be applied to this as well.
+
+## O2S
+
+The acceptable values for O2S were stated to range within [70, 132]. The filtering reduced the sample size to **36,031**
+
+```{r}
+R_O2S_lim <- R_O2S %>%  # Remove "invalids" and "outliers"
+  filter(time >= 0, time < 96,
+         valuenum >= 70, valuenum <= 132)  
+
+R_O2S_lim$icustay_id %>% unique %>% length
+# 36,031 samples
+
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_O2S_lim,
+           aspect = 1,
+           xlab = "Hour", ylab = "O2S",
+           main = "O2S Observation Density",
+           xbins = 96, colramp = rf)
+```
+
+Again, a strange banded plot. Testing the plotting again with a different color pallete revealed that the white bands are "no observations" rather than very dense areas. This seems to indicate that a great majority of the observed values are in the top. Let's see what this looks like in a boxplot.
+
+```{r}
+boxplot(valuenum ~ hour,
+        data = R_O2S_lim,
+        main = "Box Plots per Hour",
+        xlab = "Hour", ylab = "HR",
+        pch = ".")
+```
+
+Based on the boxplot, I'm thinking we go with a stationary hypothesis again. Let's look at the mean and confidence intervals.
+
+```{r}
+O2S_hourly_summary <- R_O2S_lim %>% group_by(hour) %>% summarise(mean = mean(valuenum),
+                                                               stdev = sd(valuenum),
+                                                               up_CI = mean + 1.96*stdev,
+                                                               low_CI = mean - 1.96*stdev)
+
+
+with(O2S_hourly_summary,
+     plot(hour, mean, type = "l",
+          main = "Hourly Means of O2S",
+          xlim = c(0, 96), ylim = c(60, 120),
+          xlab = "Hour", ylab = "Mean O2S"))
+
+with(O2S_hourly_summary,
+     polygon(c(hour, rev(hour)),
+             c(up_CI, rev(low_CI)),
+             col = "lightblue",
+             border = FALSE))
+with(O2S_hourly_summary,
+     lines(hour, mean, lwd = 2))
+with(O2S_hourly_summary,
+     lines(hour, low_CI, lty = 2, col = "red"))
+with(O2S_hourly_summary,
+     lines(hour, up_CI, lty = 2, col = "red"))
+```
+
+The plot is practically saying the same thing as the data. Let's check via regression.
+
+```{r}
+O2S_lm1 <- lm(valuenum ~ time,
+              data = R_O2S_lim)
+
+summary(O2S_lm1)
+```
+
+Thwarted again: the coefficient given for time is small (2.76e-04), but highly significant (p = 7.68e-05), indicated a small, but strong positive relationship between time and oxygen saturation. We check how the relationships change when the data is grouped based on outcome.
+
+### Stratified
+
+```{r}
+
+hexbinplot(valuenum ~ as.numeric(time),
+                          data = R_O2S_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+                          aspect = 1,
+                          xlab = "Hour", ylab = "O2S",
+                          main = "Not Dead",
+                          xbins = 96, colramp = rf)
+```
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_O2S_lim %>% filter(icustay_id %in% Death96$icustay_id),
+           aspect = 1, ylim = c(65, 120),
+           xlab = "Hour", ylab = "O2S",
+           main = "Dead",
+           xbins = 96, colramp = rf)
+```
+
+The hexplots look quite similar. Is this a prelude to not being able to see a clear distinction early on between the two groups?
+
+           
+```{r}
+par(mfrow=c(1,2))
+boxplot(valuenum ~ hour,
+        data = R_O2S_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+        main = "Not Dead",
+        xlab = "Hour", ylab = "O2S",
+        pch = ".")
+boxplot(valuenum ~ hour,
+        data = R_O2S_lim %>% filter(icustay_id %in% Death96$icustay_id),
+        main = "Dead", ylim=c(70, 110),
+        xlab = "Hour", ylab = "O2S",
+        pch = ".")
+```
+
+The only real difference is the larger IQ for the cases, but this may well just be due to lower sample size. We want to test the hypothesis that the two have the same relationship with time, using regression (approx. equal coefficients and intercepts, will check unless results are startlingly different).
+
+
+```{r, results = 'hide'}
+O2S_lm_alive <- lm(valuenum ~ time,
+                  data = R_O2S_lim %>% filter(!icustay_id %in% Death96$icustay_id))
+O2S_lm_dead <- lm(valuenum ~ time,
+                 data = R_O2S_lim %>% filter(icustay_id %in% Death96$icustay_id))
+
+summary(O2S_lm_alive)
+# 2.81e-04, p = 4.53e-05
+summary(O2S_lm_dead)
+# 3.26e-04, p = 0.679
+```
+
+Here we find a significant difference: In the controls, time was a highly significant variable (p = 4.53e-05), while for the cases, time had an insignificant p = 0.679, indicating that in those that died, there was no significant change over time when it came to blood oxygen levels, while for those that didn't die, there was a small increase per time. We check how the sample sizes were distributed per hour.
+
+
+```{r O2SDeathSampleCheck}
+O2S_Sample_Table <- cbind(Alive = R_O2S_lim %>%
+                           filter(!icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist,
+                         
+                         Dead = R_O2S_lim %>%
+                           filter(icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id)))  %>% 
+                           select(count) %>% unlist,
+                         
+                         Total = R_O2S_lim %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist) %>% as.data.frame()
+
+rownames(O2S_Sample_Table) = seq(1,96)
+O2S_Sample_Table
+  
+```
+
+```{r}
+plot(O2S_Sample_Table$Alive, type = "l",
+     main = "O2S Cohort Count", xlab = "Hour", ylab = "Subjects",
+     ylim = c(0, 20000))
+lines(O2S_Sample_Table$Dead, col = "red")
+lines(O2S_Sample_Table$Total, lty = 3)
+legend('topright', c("Did not die", "Died", "Total"),
+       lty = c(1,1,3), col = c("black", "red", "black"))
+```
+
+Sample results are similar to HR; case samples never dropped below 200. Some other final plots.
+
+```{r}
+# mean heart rate and CI's
+with(R_O2S_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     plot(hour, mean, type = "l",
+          ylim = c(80, 120),
+          ylab = "Mean O2S", xlab = "Hour",
+          main = "Average O2S"))
+with(R_O2S_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     lines(hour, mean, col = "red"))
+
+# CI alive
+with(R_O2S_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+with(R_O2S_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+
+# CI dead
+with(R_O2S_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+with(R_O2S_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+
+
+
+
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+In general, those who died had lower O2S than those who did not die.
+
+
+```{r O2SRanges}
+# Min and max
+with(R_O2S_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     plot(hour, max, type = "l",
+          ylim = c(70, 120),
+          ylab = "O2S", xlab = "Hour",
+          main = "Extreme O2S"))
+with(R_O2S_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "black"))
+
+
+with(R_O2S_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "red"))
+with(R_O2S_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     lines(hour, max, col = "red"))
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+Interesting: the seemingly constant maximum value for those that died - what does this mean? Let's take a look at this by extracting the data for those that died
+
+```{r}
+CheckO2S <- R_O2S_lim %>% filter(icustay_id %in% Death96$icustay_id)
+
+CheckO2S %>% filter(valuenum == 100) %>% select(subject_id) %>% unique %>% nrow
+# 1427 patients overall that had 100's at any point in time
+# This probably wasn't necessarily a mistake; the measure, after all, is in %.
+```
+
+There were 1427 people that died tht had 100% O2S records at any point; this probably isn't a mistake.
+
+## SBP
+
+The range of valid values for SBP fall in the interval [33, 341]. The filtering results in a cohort size of 36,033
+
+```{r}
+R_SBP_lim <- R_SBP %>%  # Remove "invalids" and "outliers"
+  filter(time >= 0, time < 96,
+         valuenum >= 33, valuenum <= 341)  
+
+R_SBP_lim$icustay_id %>% unique %>% length
+# 36,033 samples
+
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_SBP_lim,
+           aspect = 1,
+           xlab = "Hour", ylab = "SBP",
+           main = "SBP Observation Density",
+           xbins = 96, colramp = rf)
+```
+
+It's a more "standard" looking hexplot, with the highest density band being around 100. There's a slight cone shape happening - maybe the variance decreases as time passes.
+
+```{r}
+boxplot(valuenum ~ hour,
+        data = R_SBP_lim,
+        main = "Box Plots per Hour",
+        xlab = "Hour", ylab = "HR",
+        pch = ".")
+```
+
+
+```{r}
+SBP_hourly_summary <- R_SBP_lim %>% group_by(hour) %>% summarise(mean = mean(valuenum),
+                                                               stdev = sd(valuenum),
+                                                               up_CI = mean + 1.96*stdev,
+                                                               low_CI = mean - 1.96*stdev)
+
+
+with(SBP_hourly_summary,
+     plot(hour, mean, type = "l",
+          main = "Hourly Means of SBP",
+          xlim = c(0, 96), ylim = c(50, 200),
+          xlab = "Hour", ylab = "Mean SBP"))
+
+with(SBP_hourly_summary,
+     polygon(c(hour, rev(hour)),
+             c(up_CI, rev(low_CI)),
+             col = "lightblue",
+             border = FALSE))
+with(SBP_hourly_summary,
+     lines(hour, mean, lwd = 2))
+with(SBP_hourly_summary,
+     lines(hour, low_CI, lty = 2, col = "red"))
+with(SBP_hourly_summary,
+     lines(hour, up_CI, lty = 2, col = "red"))
+```
+
+Nothing really supporting the decreasing variance, so maybe that's just me reaching.
+
+```{r}
+SBP_lm1 <- lm(valuenum ~ time,
+              data = R_SBP_lim)
+
+summary(SBP_lm1)
+```
+
+The given coefficient indicates that the relationship between time and SBP were not significant (at least at an alpha = 0.05). The coefficient was positive (1e-03), with a p-value of 0.0855.
+
+### Stratified
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+                          data = R_SBP_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+                          aspect = 1,
+                          xlab = "Hour", ylab = "SBP",
+                          main = "Not Dead",
+                          xbins = 96, colramp = rf)
+```
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_SBP_lim %>% filter(icustay_id %in% Death96$icustay_id),
+           aspect = 1, ylim = c(0, 350),
+           xlab = "Hour", ylab = "SBP",
+           main = "Dead",
+           xbins = 96, colramp = rf)
+```
+
+The hexplots look identical, more or less, I'm gonna go on a gander and hypothesize they behave the same. Let's check via boxplots and regression.
+
+           
+```{r}
+par(mfrow=c(1,2))
+boxplot(valuenum ~ hour,
+        data = R_SBP_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+        main = "Not Dead", ylim = c(0, 350),
+        xlab = "Hour", ylab = "SBP",
+        pch = ".")
+boxplot(valuenum ~ hour,
+        data = R_SBP_lim %>% filter(icustay_id %in% Death96$icustay_id),
+        main = "Dead", ylim = c(0, 350),
+        xlab = "Hour", ylab = "SBP",
+        pch = ".")
+```
+
+AH, but there seems to be some difference in the median lines - those that died seem to have had lower SBP than those who were alive.
+
+
+```{r, results = 'hide'}
+SBP_lm_alive <- lm(valuenum ~ time,
+                  data = R_SBP_lim %>% filter(!icustay_id %in% Death96$icustay_id))
+SBP_lm_dead <- lm(valuenum ~ time,
+                 data = R_SBP_lim %>% filter(icustay_id %in% Death96$icustay_id))
+
+summary(SBP_lm_alive)
+# 2.81e-04, p = 4.53e-05
+summary(SBP_lm_dead)
+# 3.26e-04, p = 0.679
+```
+
+Here we find a significant difference: In the controls, time was a highly significant variable (p = 4.53e-05), while for the cases, time had an insignificant p = 0.679, indicating that in those that died, there was no significant change over time when it came to blood oxygen levels, while for those that didn't die, there was a small increase per time. We check how the sample sizes were distributed per hour.
+
+
+```{r SBPDeathSampleCheck}
+SBP_Sample_Table <- cbind(Alive = R_SBP_lim %>%
+                           filter(!icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist,
+                         
+                         Dead = R_SBP_lim %>%
+                           filter(icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id)))  %>% 
+                           select(count) %>% unlist,
+                         
+                         Total = R_SBP_lim %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist) %>% as.data.frame()
+
+rownames(SBP_Sample_Table) = seq(1,96)
+SBP_Sample_Table
+  
+```
+
+```{r}
+plot(SBP_Sample_Table$Alive, type = "l",
+     main = "SBP Cohort Count", xlab = "Hour", ylab = "Subjects",
+     ylim = c(0, 20000))
+lines(SBP_Sample_Table$Dead, col = "red")
+lines(SBP_Sample_Table$Total, lty = 3)
+legend('topright', c("Did not die", "Died", "Total"),
+       lty = c(1,1,3), col = c("black", "red", "black"))
+```
+
+Sample results are similar to HR; case samples never dropped below 200. Some other final plots.
+
+```{r}
+# mean heart rate and CI's
+with(R_SBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     plot(hour, mean, type = "l",
+          ylim = c(80, 120),
+          ylab = "Mean SBP", xlab = "Hour",
+          main = "Average SBP"))
+with(R_SBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     lines(hour, mean, col = "red"))
+
+# CI alive
+with(R_SBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+with(R_SBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+
+# CI dead
+with(R_SBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+with(R_SBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+
+
+
+
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+In general, those who died had lower SBP than those who did not die.
+
+
+```{r SBPRanges}
+# Min and max
+with(R_SBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     plot(hour, max, type = "l",
+          ylim = c(70, 120),
+          ylab = "SBP", xlab = "Hour",
+          main = "Extreme SBP"))
+with(R_SBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "black"))
+
+
+with(R_SBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "red"))
+with(R_SBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     lines(hour, max, col = "red"))
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+
+## DBP
+
+Valid interval for DBP is [5, 308]. We end up with 36,033 samples.
+
+```{r}
+R_DBP_lim <- R_DBP %>%  # Remove "invalids" and "outliers"
+  filter(time >= 0, time < 96,
+         valuenum >= 5, valuenum <= 308)  
+
+R_DBP_lim$icustay_id %>% unique %>% length
+# 36,033 samples
+
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_DBP_lim,
+           aspect = 1,
+           xlab = "Hour", ylab = "DBP",
+           main = "DBP Observation Density",
+           xbins = 96, colramp = rf)
+```
+
+Again, a "standard" looking hexplot, with what seems to be a dense region around 50-100.
+
+```{r}
+boxplot(valuenum ~ hour,
+        data = R_DBP_lim,
+        main = "Box Plots per Hour",
+        xlab = "Hour", ylab = "DBP",
+        pch = ".")
+```
+
+
+```{r}
+DBP_hourly_summary <- R_DBP_lim %>% group_by(hour) %>% summarise(mean = mean(valuenum),
+                                                               stdev = sd(valuenum),
+                                                               up_CI = mean + 1.96*stdev,
+                                                               low_CI = mean - 1.96*stdev)
+
+
+with(DBP_hourly_summary,
+     plot(hour, mean, type = "l",
+          main = "Hourly Means of DBP",
+          xlim = c(0, 96), ylim = c(20, 100),
+          xlab = "Hour", ylab = "Mean DBP"))
+
+with(DBP_hourly_summary,
+     polygon(c(hour, rev(hour)),
+             c(up_CI, rev(low_CI)),
+             col = "lightblue",
+             border = FALSE))
+with(DBP_hourly_summary,
+     lines(hour, mean, lwd = 2))
+with(DBP_hourly_summary,
+     lines(hour, low_CI, lty = 2, col = "red"))
+with(DBP_hourly_summary,
+     lines(hour, up_CI, lty = 2, col = "red"))
+```
+
+
+```{r}
+DBP_lm1 <- lm(valuenum ~ time,
+              data = R_DBP_lim)
+
+summary(DBP_lm1)
+```
+
+The given coefficient indicates that the relationship between time and DBP were not significant. The coefficient was positive (4.08e-04), with a p-value of 0.258.
+
+
+### Stratified
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+                          data = R_DBP_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+                          aspect = 1,
+                          xlab = "Hour", ylab = "DBP",
+                          main = "Not Dead",
+                          xbins = 96, colramp = rf)
+```
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_DBP_lim %>% filter(icustay_id %in% Death96$icustay_id),
+           aspect = 1, ylim = c(0, 350),
+           xlab = "Hour", ylab = "DBP",
+           main = "Dead",
+           xbins = 96, colramp = rf)
+```
+
+We have what appears to be less spread in the case group, which isn't too unexpected since it also likely has less samples to begin with.
+
+           
+```{r}
+par(mfrow=c(1,2))
+boxplot(valuenum ~ hour,
+        data = R_DBP_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+        main = "Not Dead", ylim = c(0, 350),
+        xlab = "Hour", ylab = "DBP",
+        pch = ".")
+boxplot(valuenum ~ hour,
+        data = R_DBP_lim %>% filter(icustay_id %in% Death96$icustay_id),
+        main = "Dead", ylim = c(0, 350),
+        xlab = "Hour", ylab = "DBP",
+        pch = ".")
+```
+
+
+```{r, results = 'hide'}
+DBP_lm_alive <- lm(valuenum ~ time,
+                  data = R_DBP_lim %>% filter(!icustay_id %in% Death96$icustay_id))
+DBP_lm_dead <- lm(valuenum ~ time,
+                 data = R_DBP_lim %>% filter(icustay_id %in% Death96$icustay_id))
+
+summary(DBP_lm_alive)
+# 5.089e-04, p = 0.162
+# F p = 0.1622
+summary(DBP_lm_dead)
+# -0.003500, p = 0.163
+# F p 0.1628
+```
+
+In both regressions, the time variable did not appear to be significant at all. This may be a signal that for DBP, longer periods of imputation are possible? We now want to check if it's reasonable to say that the two models are actually the same.
+
+```{r}
+# We compare the coefficients in intercept only models
+
+DBP_lm_alive1 <- lm(valuenum ~ 1, 
+                    data = R_DBP_lim %>% filter(!icustay_id %in% Death96$icustay_id))
+DBP_lm_dead1 <- lm(valuenum ~ 1,
+                   data = R_DBP_lim %>% filter(icustay_id %in% Death96$icustay_id))
+
+# Z-Test statistic
+DBP_Z <- (DBP_lm_alive1$coef - DBP_lm_dead1$coef)/
+  (sqrt((summary(DBP_lm_alive1)$coef[2])^2 +
+          (summary(DBP_lm_dead1)$coef[2])^2))
+
+DBP_Z %>% round(2)
+# 45 > 1.96; REJECT
+# Test rejects NULL hypothesis of equality.
+```
+
+The Z-test rejects the null hypothesis that the intercept models are equal, indicating that when stratified, the DBP tends to behave differently depending on whether one is a case or a control.
+
+
+```{r DBPDeathSampleCheck}
+DBP_Sample_Table <- cbind(Alive = R_DBP_lim %>%
+                           filter(!icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist,
+                         
+                         Dead = R_DBP_lim %>%
+                           filter(icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id)))  %>% 
+                           select(count) %>% unlist,
+                         
+                         Total = R_DBP_lim %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist) %>% as.data.frame()
+
+rownames(DBP_Sample_Table) = seq(1,96)
+DBP_Sample_Table
+  
+```
+
+```{r}
+plot(DBP_Sample_Table$Alive, type = "l",
+     main = "DBP Cohort Count", xlab = "Hour", ylab = "Subjects",
+     ylim = c(0, 20000))
+lines(DBP_Sample_Table$Dead, col = "red")
+lines(DBP_Sample_Table$Total, lty = 3)
+legend('topright', c("Did not die", "Died", "Total"),
+       lty = c(1,1,3), col = c("black", "red", "black"))
+```
+
+Sample results are similar to HR; case samples never dropped below 200. Some other final plots.
+
+```{r}
+# mean DBP and CI's
+with(R_DBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     plot(hour, mean, type = "l",
+          ylim = c(80, 100),
+          ylab = "Mean DBP", xlab = "Hour",
+          main = "Average DBP"))
+with(R_DBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     lines(hour, mean, col = "red"))
+
+# CI alive
+with(R_DBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+with(R_DBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+
+# CI dead
+with(R_DBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+with(R_DBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+
+
+
+
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+Despite the regression Z-test asserting that the two groups behave differently, one can see that there is a general similarity in the range of both - just a higher volatility in the cases.
+
+```{r DBPRanges}
+# Min and max
+with(R_DBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     plot(hour, max, type = "l",
+          ylim = c(5, 308),
+          ylab = "DBP", xlab = "Hour",
+          main = "Extreme DBP"))
+with(R_DBP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "black"))
+
+
+with(R_DBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "red"))
+with(R_DBP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     lines(hour, max, col = "red"))
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+The DBP's of those in the control group definitely spiked higher than those in the cases. This is supported by the intercept regressions which had a higher intercept for the controls than the cases.
+
+## TEMP
+
+Acceptable temperatures are in the interval [27, 50]. This reduces the temperature sample size to **21,599**, notably the smallest individual cohort size so far.
+
+```{r}
+R_TEMP_lim <- R_TEMP %>%  # Remove "invalids" and "outliers"
+  filter(time >= 0, time < 96,
+         valuenum >= 27, valuenum <= 50)  
+
+R_TEMP_lim$icustay_id %>% unique %>% length
+# 21,599 samples
+
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_TEMP_lim,
+           aspect = 1,
+           xlab = "Hour", ylab = "TEMP",
+           main = "TEMP Observation Density",
+           xbins = 96, colramp = rf)
+```
+
+Again, a "standard" looking hexplot, with what seems to be a dense region around 35-37, which seems, intuitively, the "normal" human temperature.
+
+```{r}
+boxplot(valuenum ~ hour,
+        data = R_TEMP_lim,
+        main = "Box Plots per Hour",
+        xlab = "Hour", ylab = "TEMP",
+        pch = ".")
+```
+
+I'm almost tempted to say that the spread decreases over time, but let's see how that holds up with confidence intervals.
+
+```{r}
+TEMP_hourly_summary <- R_TEMP_lim %>% group_by(hour) %>% summarise(mean = mean(valuenum),
+                                                               stdev = sd(valuenum),
+                                                               up_CI = mean + 1.96*stdev,
+                                                               low_CI = mean - 1.96*stdev)
+
+
+with(TEMP_hourly_summary,
+     plot(hour, mean, type = "l",
+          main = "Hourly Means of TEMP",
+          xlim = c(0, 96), ylim = c(32, 42),
+          xlab = "Hour", ylab = "Mean TEMP"))
+
+with(TEMP_hourly_summary,
+     polygon(c(hour, rev(hour)),
+             c(up_CI, rev(low_CI)),
+             col = "lightblue",
+             border = FALSE))
+with(TEMP_hourly_summary,
+     lines(hour, mean, lwd = 2))
+with(TEMP_hourly_summary,
+     lines(hour, low_CI, lty = 2, col = "red"))
+with(TEMP_hourly_summary,
+     lines(hour, up_CI, lty = 2, col = "red"))
+```
+
+
+```{r}
+TEMP_lm1 <- lm(valuenum ~ time,
+              data = R_TEMP_lim)
+
+summary(TEMP_lm1)
+```
+
+The given coefficient indicates that the relationship between time and TEMP is positive and significant (coefficient = 1.3e-04, p = 0.00482).
+
+
+### Stratified
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+                          data = R_TEMP_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+                          aspect = 1,
+                          xlab = "Hour", ylab = "TEMP",
+                          main = "Not Dead",
+                          xbins = 96, colramp = rf)
+```
+
+```{r}
+hexbinplot(valuenum ~ as.numeric(time),
+           data = R_TEMP_lim %>% filter(icustay_id %in% Death96$icustay_id),
+           aspect = 1, ylim = c(25, 50),
+           xlab = "Hour", ylab = "TEMP",
+           main = "Dead",
+           xbins = 96, colramp = rf)
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+boxplot(valuenum ~ hour,
+        data = R_TEMP_lim %>% filter(!icustay_id %in% Death96$icustay_id),
+        main = "Not Dead", ylim = c(27, 50),
+        xlab = "Hour", ylab = "TEMP",
+        pch = ".")
+boxplot(valuenum ~ hour,
+        data = R_TEMP_lim %>% filter(icustay_id %in% Death96$icustay_id),
+        main = "Dead", ylim = c(27, 50),
+        xlab = "Hour", ylab = "TEMP",
+        pch = ".")
+```
+
+
+```{r, results = 'hide'}
+TEMP_lm_alive <- lm(valuenum ~ time,
+                  data = R_TEMP_lim %>% filter(!icustay_id %in% Death96$icustay_id))
+TEMP_lm_dead <- lm(valuenum ~ time,
+                 data = R_TEMP_lim %>% filter(icustay_id %in% Death96$icustay_id))
+
+summary(TEMP_lm_alive)
+# 1.07e-04, p = 0.02 (time)
+# 37 intercept
+summary(TEMP_lm_dead)
+# 1.02e-03, p = 0.02
+# 36 intercept
+```
+
+Both are significant at the 95% confidence level and at roughly the same level of confidence too. What we want to know now is if we can equate the two models and say that temperature was behaving similarly across both groups.
+
+```{r}
+# We compare the coefficients of time first
+
+summary(TEMP_lm_alive)$coef[1,2]
+TEMP_lm_alive$coef
+
+# Z-Test statistic for time
+TEMP_Z_t <- (TEMP_lm_alive$coef[2] - TEMP_lm_dead$coef[2])/
+  (sqrt((summary(TEMP_lm_alive)$coef[2,2])^2 +
+          (summary(TEMP_lm_dead)$coef[2,2])^2))
+
+# Critical value is |1.96|
+TEMP_Z_t %>% round(2)
+# -2.08 < -1.96; they are significantly different.
+
+# Z-Test statistic for intercept
+TEMP_Z_i <- (TEMP_lm_alive$coef[1] - TEMP_lm_dead$coef[1])/
+  (sqrt((summary(TEMP_lm_alive)$coef[1,2])^2 +
+          (summary(TEMP_lm_dead)$coef[1,2])^2))
+
+TEMP_Z_i %>% round(2)
+# 14.54 > 1.96; EJECT
+# Test rejects NULL hypothesis of equality.
+```
+
+Both Z-tests rejected the null hypothesis of equality. In this case, we say that the behavior of temperature differed between the two groups. In particular: though both are shown to increase in time, the increase in temperature for non-cases was steeper (higher time coefficient) than that of controls. Meanwhile, the "base" temperature for cases was lower than controls.
+
+
+```{r TEMPDeathSampleCheck}
+TEMP_Sample_Table <- cbind(Alive = R_TEMP_lim %>%
+                           filter(!icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist,
+                         
+                         Dead = R_TEMP_lim %>%
+                           filter(icustay_id %in% Death96$icustay_id) %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id)))  %>% 
+                           select(count) %>% unlist,
+                         
+                         Total = R_TEMP_lim %>%
+                           group_by(hour) %>%
+                           summarise(count = length(unique(subject_id))) %>% 
+                           select(count) %>% unlist) %>% as.data.frame()
+
+rownames(TEMP_Sample_Table) = seq(1,96)
+TEMP_Sample_Table
+  
+```
+
+Unfortunately, the time variable suffers from incredibly low sample sizes, with cohort sizes for the case reaching ~50-70 in the latter hours, casting much doubt on the above results. The difference in behavior depending on group might be attributed to this issue.
+
+```{r}
+plot(TEMP_Sample_Table$Alive, type = "l",
+     main = "TEMP Cohort Count", xlab = "Hour", ylab = "Subjects",
+     ylim = c(0, 20000))
+lines(TEMP_Sample_Table$Dead, col = "red")
+lines(TEMP_Sample_Table$Total, lty = 3)
+legend('topright', c("Did not die", "Died", "Total"),
+       lty = c(1,1,3), col = c("black", "red", "black"))
+```
+
+Low samples across the board.
+
+```{r}
+# mean TEMP and CI's
+with(R_TEMP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     plot(hour, mean, type = "l",
+          ylim = c(32, 42),
+          ylab = "Mean TEMP", xlab = "Hour",
+          main = "Average TEMP"))
+with(R_TEMP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(mean = mean(valuenum)),
+     lines(hour, mean, col = "red"))
+
+# CI alive
+with(R_TEMP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+with(R_TEMP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "black", lty=3))
+
+# CI dead
+with(R_TEMP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean + 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+with(R_TEMP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(sd = sd(valuenum),
+                 mean = mean(valuenum),
+                 CI = mean - 1.96*sd),
+       lines(hour, CI, col = "red", lty=3))
+
+
+
+
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+
+```{r TEMPRanges}
+# Min and max
+with(R_TEMP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     plot(hour, max, type = "l",
+          ylim = c(27, 50),
+          ylab = "TEMP", xlab = "Hour",
+          main = "Extreme TEMP"))
+with(R_TEMP_lim %>%
+       filter(!icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "black"))
+
+
+with(R_TEMP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(min = min(valuenum)),
+     lines(hour, min, col = "red"))
+with(R_TEMP_lim %>%
+       filter(icustay_id %in% Death96$icustay_id) %>%
+       group_by(hour) %>%
+       summarise(max = max(valuenum)),
+     lines(hour, max, col = "red"))
+
+legend('top', c("Did not die", "Died"),
+       col = c("black", "red"), lty = 1,
+       ncol = 2, cex = 0.8)
+
+```
+
+Unlike in all the other variables, both controls and cases showed a lot of volatility in their maxima and minima. This is likely due to low sample sizes in general.
+
+# Description of 4-HR-L Cohort
+
+We've already seen the issue of low sample sizes, particularly in cases and in temperature. This is precisely why we most likely want to implement the **4-HR-L** scheme, which is described below:
+
+1. Measurements are aggregated in 4 hour chunks.
+2. A subject is removed from the cohort if it has empty measurements for more than 1 chunk in a row.
+
+We now combine what we had here (filtering based on outliers), and what we had in DDP2 (filtering based on data availability per chunk), and come up with a (**tentative**) final cohort for the modelling process.
+
+```{r}
+# Get Cohort for filtered data, F_<Name>
+
+F_HR_Cohort <- R_HR_lim %>%
+  group_by(hour) %>%
+  summarise(subjects = list(unique(subject_id)))
+F_RR_Cohort <- R_HR_lim %>%
+  group_by(hour) %>%
+  summarise(subjects = list(unique(subject_id)))
+F_O2S_Cohort <- R_HR_lim %>%
+  group_by(hour) %>%
+  summarise(subjects = list(unique(subject_id)))
+F_SBP_Cohort <- R_HR_lim %>%
+  group_by(hour) %>%
+  summarise(subjects = list(unique(subject_id)))
+F_DBP_Cohort <- R_HR_lim %>%
+  group_by(hour) %>%
+  summarise(subjects = list(unique(subject_id)))
+F_TEMP_Cohort <- R_HR_lim %>%
+  group_by(hour) %>%
+  summarise(subjects = list(unique(subject_id)))
+```
+
+```{r Get4HRL}
+binned_F4HR <- Binner(HR_Cohort, granulation = 4, lenient = TRUE, indiv = FALSE)
+binned_F4O2S <- Binner(O2S_Cohort, granulation = 4, lenient = TRUE,indiv = FALSE)
+binned_F4RR <- Binner(RR_Cohort, granulation = 4, lenient = TRUE,indiv = FALSE)
+binned_F4SBP <- Binner(SBP_Cohort, granulation = 4, lenient = TRUE, indiv = FALSE)
+binned_F4DBP <- Binner(DBP_Cohort, granulation = 4,lenient = TRUE, indiv = FALSE)
+binned_F4TEMP <- Binner(TEMP_Cohort, granulation = 4, lenient = TRUE, indiv = FALSE)
+```
+
+Let's look at the sample sizes at each maximum time horizon. The binning process assumes that we will choose a cut-off time for data, and this is the latest time we will consider. The binning assumes that at that point in time t, there are N_t subjects with "complete" measurements up until time t.
+
+```{r}
+lapply(binned_F4HR, length) %>% unlist %>% plot(type = "l",
+                                              main = "4-HRL Cohort Size",
+                                              xlab = "Bin", ylab = "Samples",
+                                              ylim = c(0, N))
+lapply(binned_F4O2S, length) %>% unlist %>% lines(col = "blue")
+lapply(binned_F4RR, length) %>% unlist %>% lines(col = "green")
+lapply(binned_F4SBP, length) %>% unlist %>% lines(col = "red")
+lapply(binned_F4DBP, length) %>% unlist %>% lines(col = "violet")
+lapply(binned_F4TEMP, length) %>% unlist %>% lines(col = "grey")
+legend('topright', c("HR", "O2S", 'RR',
+                     'SBP', 'DBP', 'TEMP'),
+       lty = 1, col = c("black", 'blue', 'green',
+                       'red', 'violet','grey'))
+```
+
+As in the case before filtering data, temperature is still the kicker that's pulling the cohort size down. Can we justify using 8-hour temperature bins (not lenient)? I asked my doctor friend and he said temperature is measured usually in 4 hour intervals, so an 8-hour bin would indicate at most one missed measurement out of every two (as long as we don't allow interpolation). Let's see how that turns out.
+
+```{r}
+binned_F8TEMP <- Binner(TEMP_Cohort, granulation = 8, lenient = FALSE, indiv = FALSE)
+```
+
+```{r}
+lapply(binned_F4HR, length) %>% unlist %>% plot(type = "l",
+                                              main = "4-HRL Cohort Size (exc. TEMP)",
+                                              xlab = "Bin", ylab = "Samples",
+                                              ylim = c(0, N))
+lapply(binned_F4O2S, length) %>% unlist %>% lines(col = "blue")
+lapply(binned_F4RR, length) %>% unlist %>% lines(col = "green")
+lapply(binned_F4SBP, length) %>% unlist %>% lines(col = "red")
+lapply(binned_F4DBP, length) %>% unlist %>% lines(col = "violet")
+lapply(binned_F4TEMP, length) %>% unlist %>% lines(col = "grey")
+lapply(binned_F8TEMP, length) %>% unlist %>% lines(col = "red", x=seq(1, 24, by = 2),
+                                                   lwd = 2)
+legend('topright', c("HR", "O2S", 'RR',
+                     'SBP', 'DBP', 'TEMP',
+                     '8-HR-S Temp'),
+       lty = 1, col = c("black", 'blue', 'green',
+                       'red', 'violet','grey', 'red'))
+```
+
+The bold red ine indicates the new sample size for 8-hour temperature. It's an improvement. Let's use that instead and look at joint sample sizes. What I mean by this is that the sample sizes indicated in the plot above are individual (per variable), it doesn't yet take into account that all subjects are members of every bin, so we merge them now and see where that leaves us.
+
+Also, at this point, we remove the people who died after they left the ICU since we're only considering those who died *in the ICU*
+
+```{r}
+
+binned_Cohort <- list()
+
+for(i in 1:24){
+  binned_Cohort[[i]] <- Reduce(intersect, list(binned_F4HR[[i]],
+                                               binned_F4O2S[[i]],
+                                               binned_F4RR[[i]],
+                                               binned_F4SBP[[i]],
+                                               binned_F4DBP[[i]]))
+}
+
+# To Bind temperature, we intersect 2:1 ratio of bins to temperature
+for(i in 1:12){
+  binned_Cohort[[2*(i-1)+1]] <- intersect(binned_Cohort[[2*(i-1)+1]],
+                                  binned_F8TEMP[[i]])
+  binned_Cohort[[2*i]] <- intersect(binned_Cohort[[2*i]],
+                                    binned_F8TEMP[[i]])
+}
+
+# Get dead per bin - at this 
+binned_Death96 <- list()
+
+for(i in 1:24){
+  binned_Death96[[i]] <- Death96 %>%
+    filter(deathtime_hours < dischtime_hours) %>% # remove censored data
+    filter(subject_id %in% binned_Cohort[[i]]) %>% # get those in current cohort
+    select(subject_id)
+}
+
+binned_Death96[[12]] %>% nrow
+
+```
+
+```{r}
+lapply(binned_Cohort, length) %>% unlist %>% plot(x = seq(4, 96, by=4), type = "l",
+                                                  main = "Joint Cohort (4/8-HR)",
+                                                  xlab = "Segment ending in Hour",
+                                                  ylab = "Samples",
+                                                  ylim = c(0, 25000))
+abline(v = c(12, 24, 48, 72), col = "blue", lty = 3)
+text(x = c(12, 24, 48, 72), y =22000,
+     labels = c(binned_Cohort[[3]] %>% length,
+                binned_Cohort[[6]] %>% length,
+                binned_Cohort[[12]] %>% length,
+                binned_Cohort[[18]] %>% length),
+     cex = 0.8)
+
+lapply(binned_Death96, nrow) %>% unlist %>%
+  lines(x = seq(4, 96, by = 4), type = "l",
+        col = "red", lty = 1)
+text(x = c(12, 24, 48, 72), y =1000,
+     labels = c(binned_Death96[[3]] %>% nrow,
+                binned_Death96[[6]] %>% nrow,
+                binned_Death96[[12]] %>% nrow,
+                binned_Death96[[18]] %>% nrow),
+     cex = 0.8)
+legend('topright', c('Joint Cohort', 'Deaths in Cohort', '12/24/48/72 HRS'),
+       lty = c(1,1,3), col = c('black', 'red', 'blue'), cex = 0.6)
+
+
+```
+
+As stated on the plot, the vertical lines indicate what can be thought of as "natural" data cut-off points. Moving forward, in the absence of definitive choice on when to cut the cohort off, we'll condsider two cut-offs - 12 hours and 24 hours. We exclude 48 and 72 since their overall sample sizes are already small and will probably just cause problems down the line.
+
+# Cohort Comparison - 12Hr vs 24Hr
+
+The cohorts have different things to offer. Recall that the data is binned (mostly) in 4-hours bins. Therefore, for a 12Hr cut-off, we'd have 5 variables with 3 bins each, and 1 variable (temp) with 2 bins (tho the 2nd bin is, conceptually, cut in half), giving a total number of dynamic variables of **17**. Meanwhile, the 24Hr cut off gives 5 variables with 6 bins each, and a variable with 3 bins, giving a total variable count of **33**. Including the static variables (Race, BMI, Service, Sex, Age, Weight) gives total maximum variable count of 23 for the 12Hr Cut-off and 39 for the 24Hr Cut-off.
+
+Obviously, the 24HR Cut-off gives more "information," but the trade off comes with a decrease in sample size. A 12Hr cutoff has a cohort size of 15,155 (127 of which are cases), while the 12Hr cutoff has a cohort size of 12,149 (85 of which are cases). For logistic regression, the "1 in 10" rule of thumb states that we generally want to use a sample that has 10 cases for each variable included in the model to avoid overfitting. This poses an issue in that an "ideal" model for each sample would include only approx. 13 and 9 variables. This might be something that's remedied later on by seeing if variables can be clustered together themselves to reduce variable count?
+
+Either way, let's look at the characterstics for both 12Hr and 24Hr cohorts. Note the corresponding cohort sizes that apply to either cut-offs:
+
+* 12-Hour Cutoff
+  + Total: 15, 155
+  + Cases: 127
+  
+* 24-Hour Cutoff
+  + Total: 12,149
+  + Cases: 85
+
+**A note** for the following analysis: the "n" stated at each time is the particular n ONCE IMPUTATION HAS BEEN DONE. The analysis is PRE-IMPUTATION, thus cohort sizes are still subject to having different sample sizes since we haven't filled them in yet. Modify the plots at a later time to indicate individual sample sizes per bin.
+
+## Heart Rate
+
+Note that we also aggregate per patient per bin (so that patients don't have multiple entries per bin).
+
+```{r}
+# The 12 Hr cohort is indexed [[3]], 24 Hr is indexed [[6]].
+# Ba suffix stands for binned observations (used only for analysis)
+
+Ba_HR <- R_HR_lim %>% filter(hour <= 24) %>%
+  group_by(bin = ceiling(hour/4),
+           subject_id) %>%
+  summarise(subj_av = mean(valuenum))  # average HR per person per bin, only til 24-hr
+
+
+
+# Overall Mean (Unstratified), but binned into 4-hour chunks.
+Ba_HR %>% filter(subject_id %in% binned_Cohort[[6]]) %>%  # get 24Hr Cohort
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", main = "Overall Average Heartrates",
+       ylim = c(86, 88))
+
+Ba_HR %>% filter(subject_id %in% binned_Cohort[[3]],
+                    bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(col = "blue", type = "o")
+
+legend('bottomright', c("24Hr", "12Hr"),
+       col = c("black", "blue"), lty = 1)
+```
+
+Below is a plot of heartrates for either cohort when stratified by death.
+
+```{r}
+# 24-Hr
+Ba_HR %>% filter(subject_id %in% binned_Cohort[[6]],
+                 !subject_id %in% binned_Death96[[6]]$subject_id) %>% # control
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", ylim = c(85, 100),
+       main = "Average HR", xlab = "Bin", ylab = "HR")
+Ba_HR %>% filter(subject_id %in% binned_Cohort[[6]],
+                 subject_id %in% binned_Death96[[6]]$subject_id) %>% # cases
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", lty = 3)
+
+# 12-HR
+Ba_HR %>% filter(subject_id %in% binned_Cohort[[3]],
+                 !subject_id %in% binned_Death96[[3]]$subject_id, # ctrl
+                 bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue")
+Ba_HR %>% filter(subject_id %in% binned_Cohort[[3]],
+                 subject_id %in% binned_Death96[[3]]$subject_id,  # cases
+                 bin <= 3) %>% # 12 hour limit 
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue", lty = 3)
+
+legend('topright', c("24Hr CTRL", "24Hr CASE",
+                     "12Hr CTRL", "12Hr CASE"),
+       col = c("black", "black", "blue", "blue"),
+       lty = c(1,3,1,3), cex = 0.8, ncol = 2)
+```
+
+In either cohort, the heart rates of those who were cases were higher than those of the controls. Note that the difference is slightly more pronounced in the 12Hr cohort, which has less observations but a higher cohort size. Let's look at data spread via boxplots.
+
+```{r}
+par(mfrow=c(2,2))
+
+boxplot(subj_av ~ bin,
+        data = Ba_HR %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CTRL
+                                !subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CTRL",
+        ylim = c(40, 200))
+mtext(paste("n = ", (12149-85)), side = 3, padj = 1.5, cex = 0.8,
+      ylim = c(40, 200))
+
+boxplot(subj_av ~ bin,
+        data = Ba_HR %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CASE
+                                subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CASE",
+        ylim = c(40, 200))
+mtext("n = 85", side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_HR %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CTRL
+                                !subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "22Hr CTRL",
+        ylim = c(40, 200), col = "blue", xlim = c(0.5,6.5))
+mtext(paste("n = ", (15155-127)), side = 3, padj = 1.5, cex = 0.8,
+      ylim = c(40, 200))
+
+boxplot(subj_av ~ bin,
+        data = Ba_HR %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CASE
+                                subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CASE",
+        ylim = c(40, 200), col = "blue", xlim = c(0.5,6.5))
+mtext("n = 127", side = 3, padj = 1.5, cex = 0.8)
+```
+
+As expected, the spread of the IQ is higher for those in the case groups due to very low case samples.
+
+## O2S
+
+```{r}
+# The 12 Hr cohort is indexed [[3]], 24 Hr is indexed [[6]].
+# Ba suffix stands for binned observations (used only for analysis)
+
+Ba_O2S <- R_O2S_lim %>% filter(hour <= 24) %>%
+  group_by(bin = ceiling(hour/4),
+           subject_id) %>%
+  summarise(subj_av = mean(valuenum))  # average O2S per person per bin, only til 24-hr
+```
+
+``` {r}
+# Overall Mean (Unstratified), but binned into 4-hour chunks.
+Ba_O2S %>% filter(subject_id %in% binned_Cohort[[6]]) %>%  # get 24Hr Cohort
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", main = "Overall Average O2S",
+       ylim = c(96.5, 97.5))
+
+Ba_O2S %>% filter(subject_id %in% binned_Cohort[[3]],
+                    bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(col = "blue", type = "o")
+
+legend('bottomright', c("24Hr", "12Hr"),
+       col = c("black", "blue"), lty = 1)
+```
+
+Notice the series are almost identical (insofar as the first few points are concerned, anyway).
+
+```{r}
+# 24-Hr
+Ba_O2S %>% filter(subject_id %in% binned_Cohort[[6]],
+                 !subject_id %in% binned_Death96[[6]]$subject_id) %>% # control
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", ylim = c(96, 98),
+       main = "Average O2S", xlab = "Bin", ylab = "O2S")
+Ba_O2S %>% filter(subject_id %in% binned_Cohort[[6]],
+                 subject_id %in% binned_Death96[[6]]$subject_id) %>% # cases
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", lty = 3)
+
+# 12-O2S
+Ba_O2S %>% filter(subject_id %in% binned_Cohort[[3]],
+                 !subject_id %in% binned_Death96[[3]]$subject_id, # ctrl
+                 bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue")
+Ba_O2S %>% filter(subject_id %in% binned_Cohort[[3]],
+                 subject_id %in% binned_Death96[[3]]$subject_id,  # cases
+                 bin <= 3) %>% # 12 hour limit 
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue", lty = 3)
+
+legend('topright', c("24Hr CTRL", "24Hr CASE",
+                     "12Hr CTRL", "12Hr CASE"),
+       col = c("black", "black", "blue", "blue"),
+       lty = c(1,3,1,3), cex = 0.8, ncol = 2)
+```
+
+Unlike heartrates which in a way showed differences based on which group the measurement belonged to, the variation between case/ctrl for O2S are very minor.
+
+```{r}
+par(mfrow=c(2,2))
+
+boxplot(subj_av ~ bin,
+        data = Ba_O2S %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CTRL
+                                !subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CTRL",
+        ylim = c(85, 110))
+mtext(paste("n = ", (12149-85)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_O2S %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CASE
+                                subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CASE",
+        ylim = c(85, 110))
+mtext("n = 85", side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_O2S %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CTRL
+                                !subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CTRL",
+        ylim = c(85, 110), col = "blue", xlim = c(0.5,6.5))
+mtext(paste("n = ", (15155-127)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_O2S %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CASE
+                                subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CASE",
+        ylim = c(85, 110), col = "blue", xlim = c(0.5,6.5))
+mtext("n = 127", side = 3, padj = 1.5, cex = 0.8)
+```
+
+Overall behavior over first 3 bins are the same for either cohorts.
+
+## RR
+
+```{r}
+# The 12 Hr cohort is indexed [[3]], 24 Hr is indexed [[6]].
+# Ba suffix stands for binned observations (used only for analysis)
+
+Ba_RR <- R_RR_lim %>% filter(hour <= 24) %>%
+  group_by(bin = ceiling(hour/4),
+           subject_id) %>%
+  summarise(subj_av = mean(valuenum))  # average RR per person per bin, only til 24-hr
+```
+
+``` {r}
+# Overall Mean (Unstratified), but binned into 4-hour chunks.
+Ba_RR %>% filter(subject_id %in% binned_Cohort[[6]]) %>%  # get 24Hr Cohort
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", main = "Overall Average RR",
+       ylim = c(19, 20))
+
+Ba_RR %>% filter(subject_id %in% binned_Cohort[[3]],
+                    bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(col = "blue", type = "o")
+
+legend('bottomright', c("24Hr", "12Hr"),
+       col = c("black", "blue"), lty = 1)
+```
+
+
+```{r}
+# 24-Hr
+Ba_RR %>% filter(subject_id %in% binned_Cohort[[6]],
+                 !subject_id %in% binned_Death96[[6]]$subject_id) %>% # control
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", ylim = c(19, 22),
+       main = "Average RR", xlab = "Bin", ylab = "RR")
+Ba_RR %>% filter(subject_id %in% binned_Cohort[[6]],
+                 subject_id %in% binned_Death96[[6]]$subject_id) %>% # cases
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", lty = 3)
+
+# 12-RR
+Ba_RR %>% filter(subject_id %in% binned_Cohort[[3]],
+                 !subject_id %in% binned_Death96[[3]]$subject_id, # ctrl
+                 bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue")
+Ba_RR %>% filter(subject_id %in% binned_Cohort[[3]],
+                 subject_id %in% binned_Death96[[3]]$subject_id,  # cases
+                 bin <= 3) %>% # 12 hour limit 
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue", lty = 3)
+
+legend('topright', c("24Hr CTRL", "24Hr CASE",
+                     "12Hr CTRL", "12Hr CASE"),
+       col = c("black", "black", "blue", "blue"),
+       lty = c(1,3,1,3), cex = 0.8, ncol = 2)
+```
+
+In both cohorts, the cases had consistently higher averages than the controls.
+
+```{r}
+par(mfrow=c(2,2))
+
+boxplot(subj_av ~ bin,
+        data = Ba_RR %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CTRL
+                                !subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CTRL",
+        ylim = c(0, 50))
+mtext(paste("n = ", (12149-85)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_RR %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CASE
+                                subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CASE",
+        ylim = c(0, 50))
+mtext("n = 85", side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_RR %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CTRL
+                                !subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CTRL",
+        ylim = c(0, 50), col = "blue", xlim = c(0.5,6.5))
+mtext(paste("n = ", (15155-127)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_RR %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CASE
+                                subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CASE",
+        ylim = c(0, 50), col = "blue", xlim = c(0.5,6.5))
+mtext("n = 127", side = 3, padj = 1.5, cex = 0.8)
+```
+
+## SBP
+
+```{r}
+# The 12 Hr cohort is indexed [[3]], 24 Hr is indexed [[6]].
+# Ba suffix stands for binned observations (used only for analysis)
+
+Ba_SBP <- R_SBP_lim %>% filter(hour <= 24) %>%
+  group_by(bin = ceiling(hour/4),
+           subject_id) %>%
+  summarise(subj_av = mean(valuenum))  # average SBP per person per bin, only til 24-hr
+```
+
+``` {r}
+# Overall Mean (Unstratified), but binned into 4-hour chunks.
+Ba_SBP %>% filter(subject_id %in% binned_Cohort[[6]]) %>%  # get 24Hr Cohort
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", main = "Overall Average SBP",
+       ylim = c(120, 122))
+
+Ba_SBP %>% filter(subject_id %in% binned_Cohort[[3]],
+                    bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(col = "blue", type = "o")
+
+legend('bottomright', c("24Hr", "12Hr"),
+       col = c("black", "blue"), lty = 1)
+```
+
+
+```{r}
+# 24-Hr
+Ba_SBP %>% filter(subject_id %in% binned_Cohort[[6]],
+                 !subject_id %in% binned_Death96[[6]]$subject_id) %>% # control
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", ylim = c(100, 140),
+       main = "Average SBP", xlab = "Bin", ylab = "SBP")
+Ba_SBP %>% filter(subject_id %in% binned_Cohort[[6]],
+                 subject_id %in% binned_Death96[[6]]$subject_id) %>% # cases
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", lty = 3)
+
+# 12-SBP
+Ba_SBP %>% filter(subject_id %in% binned_Cohort[[3]],
+                 !subject_id %in% binned_Death96[[3]]$subject_id, # ctrl
+                 bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue")
+Ba_SBP %>% filter(subject_id %in% binned_Cohort[[3]],
+                 subject_id %in% binned_Death96[[3]]$subject_id,  # cases
+                 bin <= 3) %>% # 12 hour limit 
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue", lty = 3)
+
+legend('topright', c("24Hr CTRL", "24Hr CASE",
+                     "12Hr CTRL", "12Hr CASE"),
+       col = c("black", "black", "blue", "blue"),
+       lty = c(1,3,1,3), cex = 0.8, ncol = 2)
+```
+
+For SBP, the cases seemed to have generally lower SBP's than the controls. Notice the difference in behavior of the cases in 12HR and 24Hr Cohorts (the criss-crossing). This is possibly due to the subjects that were in the 12HR cohort that were removed to form the 24Hr cohort having higher SBP measurements.
+
+```{r}
+par(mfrow=c(2,2))
+
+boxplot(subj_av ~ bin,
+        data = Ba_SBP %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CTRL
+                                !subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CTRL",
+        ylim = c(40, 240))
+mtext(paste("n = ", (12149-85)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_SBP %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CASE
+                                subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CASE",
+        ylim = c(40, 240))
+mtext("n = 85", side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_SBP %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CTRL
+                                !subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CTRL",
+        ylim = c(40, 240), col = "blue", xlim = c(0.5,6.5))
+mtext(paste("n = ", (15155-127)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_SBP %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CASE
+                                subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CASE",
+        ylim = c(40, 240), col = "blue", xlim = c(0.5,6.5))
+mtext("n = 127", side = 3, padj = 1.5, cex = 0.8)
+```
+
+## DBP
+
+While ideally, we'd take this time to look at Pulse Pressure (SBP - DBP), without proceeding to impute any missing values, we can't really compute it yet, so we look at DBP for now.
+
+```{r}
+# The 12 Hr cohort is indexed [[3]], 24 Hr is indexed [[6]].
+# Ba suffix stands for binned observations (used only for analysis)
+
+Ba_DBP <- R_DBP_lim %>% filter(hour <= 24) %>%
+  group_by(bin = ceiling(hour/4),
+           subject_id) %>%
+  summarise(subj_av = mean(valuenum))  # average DBP per person per bin, only til 24-hr
+```
+
+``` {r}
+# Overall Mean (Unstratified), but binned into 4-hour chunks.
+Ba_DBP %>% filter(subject_id %in% binned_Cohort[[6]]) %>%  # get 24Hr Cohort
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", main = "Overall Average DBP",
+       ylim = c(60, 61))
+
+Ba_DBP %>% filter(subject_id %in% binned_Cohort[[3]],
+                    bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(col = "blue", type = "o")
+
+legend('bottomright', c("24Hr", "12Hr"),
+       col = c("black", "blue"), lty = 1)
+```
+
+
+```{r}
+# 24-Hr
+Ba_DBP %>% filter(subject_id %in% binned_Cohort[[6]],
+                 !subject_id %in% binned_Death96[[6]]$subject_id) %>% # control
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", ylim = c(60, 64),
+       main = "Average DBP", xlab = "Bin", ylab = "DBP")
+Ba_DBP %>% filter(subject_id %in% binned_Cohort[[6]],
+                 subject_id %in% binned_Death96[[6]]$subject_id) %>% # cases
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", lty = 3)
+
+# 12-DBP
+Ba_DBP %>% filter(subject_id %in% binned_Cohort[[3]],
+                 !subject_id %in% binned_Death96[[3]]$subject_id, # ctrl
+                 bin <= 3) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue")
+Ba_DBP %>% filter(subject_id %in% binned_Cohort[[3]],
+                 subject_id %in% binned_Death96[[3]]$subject_id,  # cases
+                 bin <= 3) %>% # 12 hour limit 
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue", lty = 3)
+
+legend('topright', c("24Hr CTRL", "24Hr CASE",
+                     "12Hr CTRL", "12Hr CASE"),
+       col = c("black", "black", "blue", "blue"),
+       lty = c(1,3,1,3), cex = 0.8, ncol = 2)
+```
+
+For DBP, the cases seemed to have generally higher DBP's than the controls. When combined with the previous observation that cases had lower SBP's than control, it stands to reason that cases would have lower PP (SBP - DBP) than controls.
+
+```{r}
+par(mfrow=c(2,2))
+
+boxplot(subj_av ~ bin,
+        data = Ba_DBP %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CTRL
+                                !subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CTRL",
+        ylim = c(10, 150))
+mtext(paste("n = ", (12149-85)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_DBP %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CASE
+                                subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CASE",
+        ylim = c(10, 150))
+mtext("n = 85", side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_DBP %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CTRL
+                                !subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CTRL",
+        ylim = c(10, 150), col = "blue", xlim = c(0.5,6.5))
+mtext(paste("n = ", (15155-127)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_DBP %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CASE
+                                subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CASE",
+        ylim = c(10, 150), col = "blue", xlim = c(0.5,6.5))
+mtext("n = 127", side = 3, padj = 1.5, cex = 0.8)
+```
+
+Note more upper outliers in bin 3, 12 Hr CTROL than its 24Hr counterpart.
+
+## Temperature
+
+Note that temperature is binned in intervals of 8, resulting in a smaller number of observation points for the 12/24 hour horizon. Also, for the 12-hour horizon, for now, we'll use the 2nd bin as if it were completely within the 12 hours.
+
+```{r}
+# The 12 Hr cohort is indexed [[3]], 24 Hr is indexed [[6]].
+# Ba suffix stands for binned observations (used only for analysis)
+
+Ba_TEMP <- R_TEMP_lim %>% filter(hour <= 24) %>%
+  group_by(bin = ceiling(hour/8),
+           subject_id) %>%
+  summarise(subj_av = mean(valuenum))  # average TEMP per person per bin, only til 24-hr
+```
+
+``` {r}
+# Overall Mean (Unstratified), but binned into 4-hour chunks.
+Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[6]]) %>%  # get 24Hr Cohort
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", main = "Overall Average TEMP",
+       ylim = c(36.5, 37.5))
+
+Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[3]],
+                    bin <= 2) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(col = "blue", type = "o")
+
+legend('bottomright', c("24Hr", "12Hr"),
+       col = c("black", "blue"), lty = 1)
+```
+
+
+```{r}
+# 24-Hr
+Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[6]],
+                 !subject_id %in% binned_Death96[[6]]$subject_id) %>% # control
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  plot(type = "o", ylim = c(35, 40),
+       main = "Average TEMP", xlab = "Bin", ylab = "TEMP")
+Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[6]],
+                 subject_id %in% binned_Death96[[6]]$subject_id) %>% # cases
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", lty = 3)
+
+# 12-TEMP
+Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[3]],
+                 !subject_id %in% binned_Death96[[3]]$subject_id, # ctrl
+                 bin <= 2) %>%
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue")
+Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[3]],
+                 subject_id %in% binned_Death96[[3]]$subject_id,  # cases
+                 bin <= 2) %>% # 12 hour limit 
+  group_by(bin) %>%
+  summarise(mean = mean(subj_av)) %>%
+  lines(type = "o", col = "blue", lty = 3)
+
+legend('topright', c("24Hr CTRL", "24Hr CASE",
+                     "12Hr CTRL", "12Hr CASE"),
+       col = c("black", "black", "blue", "blue"),
+       lty = c(1,3,1,3), cex = 0.8, ncol = 2)
+```
+
+In both cohorts, the cases seemed to have a slightly lower temperature than those who were controls.
+
+```{r}
+par(mfrow=c(2,2))
+
+boxplot(subj_av ~ bin,
+        data = Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CTRL
+                                !subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CTRL",
+        ylim = c(30, 45))
+mtext(paste("n = ", (12149-85)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[6]],  # 24Hr CASE
+                                subject_id %in% binned_Death96[[6]]$subject_id),
+        pch = ".", main = "24Hr CASE",
+        ylim = c(30, 45))
+mtext("n = 85", side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CTRL
+                                !subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CTRL",
+        ylim = c(30, 45), col = "blue", xlim = c(0.5,3.5))
+mtext(paste("n = ", (15155-127)), side = 3, padj = 1.5, cex = 0.8)
+
+boxplot(subj_av ~ bin,
+        data = Ba_TEMP %>% filter(subject_id %in% binned_Cohort[[3]],  # 12Hr CASE
+                                subject_id %in% binned_Death96[[3]]$subject_id,
+                                bin <= 3),
+        pch = ".", main = "12Hr CASE",
+        ylim = c(30, 45), col = "blue", xlim = c(0.5,3.5))
+mtext("n = 127", side = 3, padj = 1.5, cex = 0.8)
+```
+
+# Additional Information
+
+```{r}
+sessionInfo()
+```
+

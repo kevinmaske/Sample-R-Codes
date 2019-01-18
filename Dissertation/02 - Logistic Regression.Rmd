@@ -1,0 +1,1989 @@
+---
+title: "Logistic Regression"
+author: "Kevin Maske"
+date: "July 9, 2018"
+output:
+  html_document:
+      code_folding: hide
+      toc: true
+      toc_float: 
+        collapsed: false
+      number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# install.packages('PRROC')
+library(tidyverse)
+library(PRROC)
+library(caret)
+library(MASS)
+library(parallel)
+```
+
+# Introduction
+
+After having obtained a set cohort with "complete" data, we proceed with an initial study in the form of logistic regressions. This is performed in a build-up manner, where we start by considering only static data, then data from the first bin, then the second, so on until we've considered all variables. We will use forward, backward, and stepwise selection to build the models, comparing AIC's for each. We end each "bin" model by looking at AUC and (pAUC, to account for the very small number of cases). Our hypothesis is that as we increase the number of bins included, we will end up with higher AUC's.
+
+The variables we are putting into consideration are as follows:
+
+* static variables
+  + Continuous: 'r age'
+  + Categorical: 'r sex' 'r race' 'r service'
+* Dynamic Variables
+  + Continuous: 'r HR' 'r DBP' 'r SBP' 'r RR' 'r O2S'
+  
+```{r DataLoad}
+data.path <- "D:/DISSERTATION ACTION/RAW DATA (PREPROCESSED)/Logistic Data"
+setwd(data.path)
+
+data <- readRDS('LogisticDataD.rds')
+
+```
+
+# Static Data Only
+
+To facilitate forward and backward selection, we specify the full model and the null model. Note that the null model will be the same across ALL the modules of this study. Further, for our current purposes (we perform cross validation after finishing forward, backward, and stepwise selection for each module). We split the data 80-20, and this will be the "standard" training-testing split.
+
+** Now modified to have stratified sampling. Specific Figures for AUC and PR-AUC will be modified during the last runs of the code; this is trivial and generally doesn't change the results. **
+
+*we now also feature confusion matrices using a threshold of 0.02, approximately the proportion of cases in the validation test set (20% split)*
+
+```{r Split}
+# get indices of the cases, and indices of the controls
+cases <- which(data$case == 1)
+controls <- which(data$case == 0)
+
+
+set.seed(1)
+train.case.idx <- createDataPartition(cases, p=0.8)$Resample1
+train.ctrl.idx <- createDataPartition(controls, p=0.8)$Resample1
+train.idx <- c(cases[train.case.idx],  # Combine
+               controls[train.ctrl.idx]) 
+```
+
+
+```{r}
+NULL_MODEL <- glm(case ~ 1,
+                  data = data[train.idx,],
+                  family = "binomial")
+
+FULL_MODEL_S <- glm(case ~ age + gender + service + race,
+                    data = data[train.idx,],
+                    family = "binomial")
+```
+
+```{r results='hide'}
+summary(NULL_MODEL)
+summary(FULL_MODEL_S)
+```
+
+## Forward Selection
+
+```{r}
+FW_Static <- stepAIC(NULL_MODEL,
+                     scope = formula(FULL_MODEL_S),
+                     direction = "forward") 
+  
+```
+
+According to the procedure, the best model is one that includes 'r service', 'r age', and 'r race'. It had an AIC of **2110.76**.
+
+## Backward Selection
+
+```{r}
+BW_Static <- stepAIC(FULL_MODEL_S,
+                     direction = "backward") 
+```
+
+The model from backward selection is identical, containing 'r age', 'r service' and 'r race', with an AIC of **2110.76**
+
+## Stepwise
+
+```{r}
+STEP_STATIC <- stepAIC(NULL_MODEL,
+                       scope = formula(FULL_MODEL_S),
+                       direction = "both")
+```
+
+## Validation
+
+We test how the 3 variable static model performs against the test data, and get the AUC and PR-AUC
+
+```{r}
+Model_Static <- glm(case ~ service + age,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(Model_Static)
+# mean(data$age[train.idx])
+```
+
+Note that in the specified model, the baseline refers to a patient who is **white**, of mean age (for the training data, i.e. **64.13 yrs. old**), and came into th ICU for a service categorized under "others". In the model, the significant variables were 'r service_nmed' 'service_cmed' 'r servcie_csurg' 'r age' 'r race_others'. Of the significant variables, the ones that had a positive effect (high chance of fatality) were 'r nmed', 'age' 'race_other'. The others had a negative effect. In particular, 'r service_surg' had a very large negative effect (in comparison to all the other effects which had magnitudes less than 1, save for the intercept).
+
+We ue the model to predict fatality probabilities for those in the test set (2828 patients), using a default threshold of 0.5 to create a contingency table. Note that the test set contains **67 cases**
+
+```{r}
+testpred_Static <- predict(Model_Static, newdata = data[-train.idx,],
+                           type = 'response')
+testtable_Static <- ifelse(testpred_Static > 0.5, 1, 0)
+
+# sum(data$case[-train.idx])
+
+testtable_Static %>% table
+# At a 0.5 threshold, there were no predicted cases
+
+
+```
+
+The 0.5 threshold cut everything off and predicted **no cases**.
+
+```{r}
+roc_Static <- roc.curve(scores.class0 = testpred_Static,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_Static)
+# 0.5554
+```
+
+Note that the colored bar at the side is a gradient of thresholds - the thresholds being suggested are very small. The AUC can be inaccurate since there are too many controls. We look at the precision recall curve, that doesn't include true negatives into its computations, and see how that performs.
+
+
+```{r}
+pr_Static <- pr.curve(scores.class0 = testpred_Static,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_Static)
+# pr-auc = 0.0158
+```
+
+We have a much, much lower AUC for this one, which reflects the bad predictions it made. We do a 10-fold cross validation to see how the model performs in such an environment, then proceed to get the mean PR-AUC for those.
+
+## 10-Fold CV
+
+Note that the 10-folds we generate here, we'll use for all further 10-fold CV's.
+
+```{r}
+set.seed(2)
+n.folds <- 10
+caseFolds <- createFolds(cases, k=n.folds)
+ctrlFolds <- createFolds(controls, k=n.folds)
+folds <- NULL
+
+for(i in 1:n.folds){
+  folds[[i]] <- c(cases[caseFolds[[i]]],
+                  controls[ctrlFolds[[i]]])
+}
+  
+```
+
+```{r}
+cv.Static <- NULL
+cv.pStatic <- NULL
+cv.aucStatic <- NULL
+cv.paucStatic <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.Static[[fold]] <- glm(case ~ service + age,  # fit model
+                           data = data, subset = cv.train.idx,
+                           family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pStatic[[fold]] <- predict(cv.Static[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucStatic[fold] <- roc.curve(scores.class0 = cv.pStatic[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucStatic[fold] <- pr.curve(scores.class0 = cv.pStatic[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucStatic) %>% round(4)
+# mean = 0.5938
+
+
+sd(cv.aucStatic) %>% round(4)
+# Standard Deviation = 0.0465
+```
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucStatic) %>% round(4)
+# mean = 0.0415
+
+
+sd(cv.paucStatic) %>% round(4)
+# sd = 0.0213
+```
+
+# Dynamic Data: Bin 1
+
+We specify the new full model.
+
+```{r}
+FULL_MODEL_B1 <- glm(case ~ age + gender + service + race +
+                      HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.1,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B1)
+```
+
+We note tha NA's appearing for the O2S variables. This indicates a linear relationship the variable shares with others, and that R is unable to find a unique solution to the regression problem without dropping it. This might be explained by the fact that O2S in general was just at oraround 100% for a large majority of the patients, making it nothing more than a constant. **CONFIRM WITH VANDA IF THIS IS CORRECT**
+
+## Forward Selection
+
+```{r}
+FW_B1 <- stepAIC(NULL_MODEL,
+                 scope = formula(FULL_MODEL_B1),
+                 direction = "forward") 
+  
+```
+
+The best forward model contains all the variables (except O2S) with an AIC of **1853.02**
+
+## Backward Selection
+
+```{r}
+BW_B1 <- stepAIC(FULL_MODEL_B1,
+                 direction = "backward") 
+```
+
+The backward selection ends up with the same model.
+
+## Stepwise
+
+```{r}
+STEP_B1 <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B1),
+                    direction = "both")
+```
+
+The stepwise selection, likewise ends up with the same model. Thus, all selection processes are in agreement with a model that contains: age service race HR.1 SBP.1 DBP.1 gender.
+
+## Validation
+
+```{r}
+Model_B1 <- glm(case ~ SBP.1 + HR.1 + service + age + DBP.1 + RR.1,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B1)
+```
+
+We test the model against the test set.
+
+```{r}
+testpred_B1 <- predict(Model_B1, newdata = data[-train.idx,],
+                           type = 'response')
+testtable_B1 <- ifelse(testpred_B1 > 0.5, 1, 0)
+
+testtable_B1 %>% table
+```
+
+At the rudimentary 0.5 threshold, only 2 cases were predicted.
+
+```{r}
+roc_B1 <- roc.curve(scores.class0 = testpred_B1,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B1)
+```
+
+We enjoy a (relatively) higher AUC of 0.77, as well as higher thresholds than that of the static model.
+
+```{r}
+pr_B1 <- pr.curve(scores.class0 = testpred_B1,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1)
+```
+
+Note that the PR-AUC of the Bin-1 model is more than double that of the static model, at 0.1682.
+
+```{r}
+conf.B1 <- ModelMetrics::confusionMatrix(actual = data$case[-train.idx],
+                                             predicted = testpred_B1,
+                                             cutoff = 0.02)
+
+rownames(conf.B1) <- c("0", "1")
+colnames(conf.B1) <- c("Ctrl", "Case")
+
+conf.B1
+```
+
+## 10-Fold CV
+
+```{r}
+cv.B1 <- NULL
+cv.pB1 <- NULL
+cv.aucB1 <- NULL
+cv.paucB1 <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B1[[fold]] <- glm(formula(Model_B1),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB1[[fold]] <- predict(cv.B1[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB1[fold] <- roc.curve(scores.class0 = cv.pB1[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB1[fold] <- pr.curve(scores.class0 = cv.pB1[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB1) %>% round(4)
+# mean = 0.7712
+
+cv.aucB1 %>% range %>% round(4)
+# Values range from 0.6783 to 0.8882
+
+sd(cv.aucB1) %>% round(4)
+# Standard Deviation = 0.0609
+```
+
+While all the AUC's are generally higher, there's also a bit more spread. This is probably due to actually being able to predict even a small number of cases.
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB1) %>% round(4)
+# mean = 0.1756
+
+cv.paucB1 %>% range %>% round(4)
+
+sd(cv.paucB1) %>% round(4)
+# sd = 0.0615
+```
+
+Similar results exist for PR-AUC: generally higher results, but larger variance in AUC.
+
+# Bin-2 Model
+
+We specify the new full model.
+
+```{r}
+FULL_MODEL_B2 <- glm(case ~ age + gender + service + race +
+                       HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.1 +
+                       HR.2 + SBP.2 + DBP.2 + RR.2 + O2S.2,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B2)
+```
+
+## Forward Selection
+
+```{r}
+FW_B2 <- stepAIC(NULL_MODEL,
+                 scope = formula(FULL_MODEL_B2),
+                 direction = "forward") 
+  
+```
+
+The best forward model contains all variables except O2S and DBP.2, with an AIC of **1843.48**.
+
+## Backward Selection
+
+```{r}
+BW_B2 <- stepAIC(FULL_MODEL_B2,
+                 direction = "backward") 
+```
+
+The backward selection ends up with the same model.
+
+## Stepwise
+
+```{r}
+STEP_B2 <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B2),
+                    direction = "both")
+```
+
+The stepwise selection, likewise ends up with the same model.
+
+## Validation
+
+```{r}
+Model_B2 <- glm(case ~ SBP.2 + service + HR.1 + age + SBP.1 + HR.2,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B2)
+```
+
+We test the model against the test set.
+
+```{r}
+testpred_B2 <- predict(Model_B2, newdata = data[-train.idx,],
+                           type = 'response')
+testtable_B2 <- ifelse(testpred_B2 > 0.5, 1, 0)
+
+testtable_B2 %>% table
+```
+
+At the rudimentary 0.5 threshold, only 3 cases were predicted.
+
+```{r}
+roc_B2 <- roc.curve(scores.class0 = testpred_B2,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B2)
+```
+
+
+```{r}
+pr_B2 <- pr.curve(scores.class0 = testpred_B2,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B2)
+```
+
+The improvement is also small, but at least it exists, with a PR-AUC of 0.1839.
+
+```{r}
+conf.B2 <- ModelMetrics::confusionMatrix(actual = data$case[-train.idx],
+                                             predicted = testpred_B2,
+                                             cutoff = 0.02)
+
+rownames(conf.B2) <- c("0", "1")
+colnames(conf.B2) <- c("Ctrl", "Case")
+
+conf.B2
+```
+
+## 10-Fold CV
+
+```{r}
+cv.B2 <- NULL
+cv.pB2 <- NULL
+cv.aucB2 <- NULL
+cv.paucB2 <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B2[[fold]] <- glm(formula(Model_B2),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB2[[fold]] <- predict(cv.B2[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB2[fold] <- roc.curve(scores.class0 = cv.pB2[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB2[fold] <- pr.curve(scores.class0 = cv.pB2[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB2) %>% round(4)
+# mean = 0.7783
+
+cv.aucB2 %>% range %>% round(4)
+
+sd(cv.aucB2) %>% round(4)
+# Standard Deviation = 0.0547
+```
+
+We had minor increases in mean and the overall range, and we also obtained a slightly smaller standard deviation.
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB2) %>% round(4)
+# mean = 0.1806
+
+cv.paucB2 %>% range %>% round(4)
+
+sd(cv.paucB2) %>% round(4)
+# sd = 0.0696
+```
+
+the PR-AUC results were higher across the board (including standard deviation).
+
+# Bin-3 Model
+
+We specify the new full model.
+
+```{r}
+FULL_MODEL_B3 <- glm(case ~ age + gender + service + race +
+                       HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.1 +
+                       HR.2 + SBP.2 + DBP.2 + RR.2 + O2S.2 +
+                       HR.3 + SBP.3 + DBP.3 + RR.3 + O2S.3,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B3)
+```
+
+## Forward Selection
+
+```{r}
+FW_B3 <- stepAIC(NULL_MODEL,
+                 scope = formula(FULL_MODEL_B3),
+                 direction = "forward") 
+  
+```
+
+The best forward model contains SBP.1, service, HR.3, RR.3, age, race, HR.1, DBP.1, gender, SBP.2, RR.1 with an AIC of 1822.8 (an improvement).
+
+## Backward Selection
+
+```{r}
+BW_B3 <- stepAIC(FULL_MODEL_B3,
+                 direction = "backward") 
+```
+
+The backward selection ends up with the same model.
+
+## Stepwise
+
+```{r}
+STEP_B3 <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B3),
+                    direction = "both")
+```
+
+The stepwise selection,
+
+## Validation
+
+```{r}
+Model_B3 <- glm(case ~ SBP.2 + service + HR.1 + age + RR.3 + HR.3 + SBP.1 + DBP.1 + 
+    DBP.2,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B3)
+```
+
+We test the model against the test set.
+
+```{r}
+testpred_B3 <- predict(Model_B3, newdata = data[-train.idx,],
+                           type = 'response')
+testtable_B3 <- ifelse(testpred_B3 > 0.5, 1, 0)
+
+testtable_B3 %>% table
+```
+
+At the rudimentary 0.5 threshold, still only 3 cases were predicted.
+
+```{r}
+roc_B3 <- roc.curve(scores.class0 = testpred_B3,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B3)
+```
+
+The ROC-AUC for B3 is 0.7642, a small decrease from the B2 model
+
+```{r}
+pr_B3 <- pr.curve(scores.class0 = testpred_B3,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B3)
+```
+
+Interstingly, the new model has a marginally **lower PR-AUC** than B2. It's PR-AUC is **0.1733**.
+
+```{r}
+conf.B3 <- ModelMetrics::confusionMatrix(actual = data$case[-train.idx],
+                                             predicted = testpred_B3,
+                                             cutoff = 0.02)
+
+rownames(conf.B3) <- c("0", "1")
+colnames(conf.B3) <- c("Ctrl", "Case")
+
+conf.B3
+```
+
+## 10-Fold CV
+
+```{r}
+cv.B3 <- NULL
+cv.pB3 <- NULL
+cv.aucB3 <- NULL
+cv.paucB3 <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B3[[fold]] <- glm(formula(Model_B3),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB3[[fold]] <- predict(cv.B3[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB3[fold] <- roc.curve(scores.class0 = cv.pB3[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB3[fold] <- pr.curve(scores.class0 = cv.pB3[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB3) %>% round(4)
+# mean = 0.7825
+
+cv.aucB3 %>% range %>% round(4)
+
+sd(cv.aucB3) %>% round(4)
+# Standard Deviation = 0.056
+```
+
+Minor increases across all figures, including a small increase in standard deviation.
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB3) %>% round(4)
+# mean = 0.1818
+
+cv.paucB3 %>% range %>% round(4)
+
+
+sd(cv.paucB3) %>% round(4)
+# sd = 0.0569
+```
+
+In terms of the cross validation, there was an overall improvement both in mean and variance; thus, the slightly lower PR-AUC might have just been because of the data split used in the non-CV study in particular.
+
+# Bin-4 Model
+
+```{r}
+FULL_MODEL_B4 <- glm(case ~ age + gender + service + race +
+                       HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.1 +
+                       HR.2 + SBP.2 + DBP.2 + RR.2 + O2S.2 +
+                       HR.3 + SBP.3 + DBP.3 + RR.3 + O2S.3 +
+                       HR.4 + SBP.4 + DBP.4 + RR.4 + O2S.4,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B4)
+```
+
+## Forward Selection
+
+```{r}
+FW_B4 <- stepAIC(NULL_MODEL,
+                 scope = formula(FULL_MODEL_B4),
+                 direction = "forward") 
+  
+```
+
+The best forward model has an AIC of **1822.54** (higher than B3!), and has the formula 
+
+case ~ SBP.1 + service + HR.3 + RR.3 + age + race + HR.1 + 
+    DBP.1 + gender + SBP.4 + RR.1.
+
+## Backward Selection
+
+```{r}
+BW_B4 <- stepAIC(FULL_MODEL_B4,
+                 direction = "backward") 
+```
+
+The same model was chosen by the backward selection.
+
+## Stepwise
+
+```{r}
+STEP_B4 <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B4),
+                    direction = "both")
+```
+
+The selections agreed on the same models.
+
+## Validation
+
+```{r}
+Model_B4_step <- glm(case ~ SBP.2 + service + HR.4 + 
+                       age + SBP.4 + RR.3 + HR.1 + DBP.1 +
+                       DBP.2,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B4_step)
+```
+
+We test and validate the model.
+
+```{r}
+testpred_B4_s <- predict(Model_B4_step, newdata = data[-train.idx,],
+                           type = 'response')
+# testpred_B4_b <- predict(Model_B4_bw, newdata = data[-train.idx,],
+                        # type = 'response')
+testtable_B4_s <- ifelse(testpred_B4_s > 0.5, 1, 0)
+# testtable_B4_b <- ifelse(testpred_B4_b > 0.5, 1, 0)
+
+testtable_B4_s %>% table
+# testtable_B4_b %>% table
+```
+
+At the 0.5 threshold (which is actually just very high), the model predicted 2 cases.
+
+```{r}
+roc_B4_s <- roc.curve(scores.class0 = testpred_B4_s,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B4_s)
+```
+
+
+```{r}
+pr_B4_s <- pr.curve(scores.class0 = testpred_B4_s,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B4_s)
+```
+
+The PR-AUC (for this data split in particular, is decreased compared to those of models with less information avaialable).
+
+```{r}
+conf.B4_s <- ModelMetrics::confusionMatrix(actual = data$case[-train.idx],
+                                             predicted = testpred_B4_s,
+                                             cutoff = 0.02)
+
+rownames(conf.B4_s) <- c("0", "1")
+colnames(conf.B4_s) <- c("Ctrl", "Case")
+
+conf.B4_s
+```
+
+## 10-Fold CV
+
+
+```{r}
+cv.B4.s <- NULL
+cv.pB4.s <- NULL
+cv.aucB4.s <- NULL
+cv.paucB4.s <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B4.s[[fold]] <- glm(formula(Model_B4_step),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB4.s[[fold]] <- predict(cv.B4.s[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB4.s[fold] <- roc.curve(scores.class0 = cv.pB4.s[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB4.s[fold] <- pr.curve(scores.class0 = cv.pB4.s[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+
+```{r}
+mean(cv.aucB4.s) %>% round(4)
+# mean = 0.7801
+
+cv.aucB4.s %>% range %>% round(4)
+
+sd(cv.aucB4.s) %>% round(4)
+# Standard Deviation = 0.0602
+```
+
+```{r}
+mean(cv.paucB4.s) %>% round(4)
+# mean = 0.1827
+
+cv.paucB4.s %>% range %>% round(4)
+
+sd(cv.paucB4.s) %>% round(4)
+# sd = 0.0649
+```
+
+We continue to see small increases in mean CV-AUC, though we note that the variance of this model is on the higher end (compared to the other models). We explore the following questions:
+
+1. We saw that the greatest AUC increase came when we added the first bin. Would the model be comparable if we added the 2nd bin first instead of the first? What about the third? The fourth?
+2. Is there a way to categorize the O2S variable such that it will be meaningful to the analysis?
+
+# What about other bins first
+
+## B2 + Static
+
+```{r}
+FULL_MODEL_B1.2 <- glm(case ~ age + gender + service + race +
+                       HR.2 + SBP.2 + DBP.2 + RR.2 + O2S.2,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B1.2)
+```
+
+### Forward Selection
+
+```{r}
+FW_B1.2 <- stepAIC(NULL_MODEL,
+                 scope = formula(FULL_MODEL_B1.2),
+                 direction = "forward") 
+  
+```
+
+Similar to the model built when there was only one bin of dynamic data available, the selected model contained all variables (except O2S), with an AIC of 1895.69
+
+### Backward Selection
+
+```{r}
+BW_B1.2 <- stepAIC(FULL_MODEL_B1.2,
+                 direction = "backward") 
+```
+
+The backward selection ends up with the same model.
+
+### Stepwise
+
+```{r}
+STEP_B1.2 <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B1.2),
+                    direction = "both")
+```
+
+The stepwise selection, likewise ends up with the same model.
+
+### Validation
+
+```{r}
+Model_B1.2 <- glm(case ~ SBP.2 + service + HR.2 + age + RR.2,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B1.2)
+```
+
+```{r}
+testpred_B1.2 <- predict(Model_B1.2, newdata = data[-train.idx,],
+                           type = 'response')
+```
+
+```{r}
+roc_B1.2 <- roc.curve(scores.class0 = testpred_B1.2,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B1.2)
+```
+
+The ROC-AUC for B1.2 is 0.7612.
+
+```{r}
+pr_B1.2 <- pr.curve(scores.class0 = testpred_B1.2,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1.2)
+```
+
+Interstingly, the PR-AUC is an outstanding (comparatively) 0.2348!!
+
+```{r}
+conf.B1.2 <- ModelMetrics::confusionMatrix(actual = data$case[-train.idx],
+                                             predicted = testpred_B1.2,
+                                             cutoff = 0.02)
+
+rownames(conf.B1.2) <- c("0", "1")
+colnames(conf.B1.2) <- c("Ctrl", "Case")
+
+conf.B1.2
+```
+### 10-Fold CV
+
+```{r}
+cv.B1.2 <- NULL
+cv.pB1.2 <- NULL
+cv.aucB1.2 <- NULL
+cv.paucB1.2 <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B1.2[[fold]] <- glm(formula(Model_B1.2),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB1.2[[fold]] <- predict(cv.B1.2[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB1.2[fold] <- roc.curve(scores.class0 = cv.pB1.2[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB1.2[fold] <- pr.curve(scores.class0 = cv.pB1.2[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB1.2) %>% round(4)
+# mean = 0.7598
+
+cv.aucB1.2 %>% range %>% round(4)
+# Values range from 0.6949 to 0.8665
+
+sd(cv.aucB1.2) %>% round(4)
+# Standard Deviation = 0.0508
+```
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB1.2) %>% round(4)
+# mean = 0.178
+
+cv.paucB1.2 %>% range %>% round(4)
+# range from 0.0798 to 0.2685
+
+sd(cv.paucB1.2) %>% round(4)
+# sd = 0.0558
+```
+
+THe high PR-AUC for the non-CV portion was not indicative of necessarily higher performance of the B2 model compared to the B1 model. The means are relatively similar.
+
+### Static + B3
+
+```{r}
+FULL_MODEL_B1.3 <- glm(case ~ age + gender + service + race +
+                       HR.3 + SBP.3 + DBP.3 + RR.3 + O2S.3,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B1.3)
+```
+
+### Forward Selection
+
+```{r}
+FW_B1.3 <- stepAIC(NULL_MODEL,
+                 scope = formula(FULL_MODEL_B1.3),
+                 direction = "forward") 
+  
+```
+
+The forward model contains all variables, and has an AIC of **1919.37**
+
+### Backward Selection
+
+```{r}
+BW_B1.3 <- stepAIC(FULL_MODEL_B1.3,
+                 direction = "backward") 
+```
+
+The backward selection ends up with the same model.
+
+### Stepwise
+
+```{r}
+STEP_B1.3 <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B1.3),
+                    direction = "both")
+```
+
+The stepwise selection, likewise ends up with the same model that uses all avaialble predictors.
+
+### Validation
+
+```{r}
+Model_B1.3 <- glm(case ~ SBP.3 + service + HR.3 + age + RR.3,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B1.3)
+```
+
+```{r}
+testpred_B1.3 <- predict(Model_B1.3, newdata = data[-train.idx,],
+                           type = 'response')
+```
+
+
+```{r}
+roc_B1.3 <- roc.curve(scores.class0 = testpred_B1.3,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B1.3)
+```
+
+
+```{r}
+pr_B1.3 <- pr.curve(scores.class0 = testpred_B1.3,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1.3)
+```
+
+```{r}
+conf.B1.3 <- ModelMetrics::confusionMatrix(actual = data$case[-train.idx],
+                                             predicted = testpred_B1.3,
+                                             cutoff = 0.02)
+
+rownames(conf.B1.3) <- c("0", "1")
+colnames(conf.B1.3) <- c("Ctrl", "Case")
+
+conf.B1.3
+```
+### 10-Fold CV
+
+```{r}
+cv.B1.3 <- NULL
+cv.pB1.3 <- NULL
+cv.aucB1.3 <- NULL
+cv.paucB1.3 <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B1.3[[fold]] <- glm(formula(Model_B1.3),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB1.3[[fold]] <- predict(cv.B1.3[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB1.3[fold] <- roc.curve(scores.class0 = cv.pB1.3[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB1.3[fold] <- pr.curve(scores.class0 = cv.pB1.3[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB1.3) %>% round(4)
+# mean = 0.7378
+
+cv.aucB1.3 %>% range %>% round(4)
+
+sd(cv.aucB1.3) %>% round(4)
+# Standard Deviation = 0.0589
+```
+
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB1.3) %>% round(4)
+# mean = 0.1440
+
+cv.paucB1.3 %>% range %>% round(4)
+
+sd(cv.paucB1.3) %>% round(4)
+# sd = 0.0496
+```
+
+The B3 only model showed a lower mean CV-AUC than all the other models thus far, as well as generally lower variance, indicating that most of the values are just contained in an interval lower than the others.
+
+## Static + B4
+
+```{r}
+FULL_MODEL_B1.4 <- glm(case ~ age + gender + service + race +
+                       HR.4 + SBP.4 + DBP.4 + RR.4 + O2S.4,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B1.4)
+```
+
+### Forward Selection
+
+```{r}
+FW_B1.4 <- stepAIC(NULL_MODEL,
+                 scope = formula(FULL_MODEL_B1.4),
+                 direction = "forward") 
+  
+```
+
+The forward model contains all variables except DBP, with an AIC of 1938.14. This has so far been the only one-bin model to exclude a variable.
+
+### Backward Selection
+
+```{r}
+BW_B1.4 <- stepAIC(FULL_MODEL_B1.4,
+                 direction = "backward") 
+```
+
+The backward selection ends up with the same model.
+
+### Stepwise
+
+```{r}
+STEP_B1.4 <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B1.4),
+                    direction = "both")
+```
+
+The stepwise selection, likewise ends up with the same model that uses all avaialble predictors excdpt DBP.4.
+
+### Validation
+
+```{r}
+Model_B1.4 <- glm(case ~ SBP.4 + service + HR.4 + age + RR.4,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B1.4)
+```
+```{r}
+testpred_B1.4 <- predict(Model_B1.4, newdata = data[-train.idx,],
+                           type = 'response')
+```
+
+```{r}
+roc_B1.4 <- roc.curve(scores.class0 = testpred_B1.4,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B1.4)
+```
+
+
+```{r}
+pr_B1.4 <- pr.curve(scores.class0 = testpred_B1.4,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1.4)
+```
+
+What a dismal PR-AUC
+
+```{r}
+conf.B1.4 <- ModelMetrics::confusionMatrix(actual = data$case[-train.idx],
+                                             predicted = testpred_B1.4,
+                                             cutoff = 0.02)
+
+rownames(conf.B1.4) <- c("0", "1")
+colnames(conf.B1.4) <- c("Ctrl", "Case")
+
+conf.B1.4
+```
+
+We wanna see why the predictive power of latter periods alone seem weaker than those of earlier periods, and the hypothesis we present is that it's because patients who've spent more time in the ICU have had treatment stabilize their measurements already, leading to less indication of abnormal measurements. Let's zero in on Heart Rate in particular, and show the boxplots of the data over the 4 bins.
+
+```{r}
+boxplot(x = data[,c('HR.1', 'HR.2', 'HR.3', 'HR.4')],
+        use.cols = TRUE,
+        pch = '.',
+        main = "Box plots of the four HR bins")
+```
+
+While it's not immediately noticeable, there do seem to be less and less outliers as time goes by, while the inner quartile doesn't particularly change. Let's compare the standard deviation of each bin. This is, of course, only a hypothesis, and with the understanding that the data is affected by the prepartory steps we took (imputation, aggregation), this offers just a viable explation for it. Also, this only look at one variable in particular.
+
+
+
+### 10-Fold CV
+
+```{r}
+cv.B1.4 <- NULL
+cv.pB1.4 <- NULL
+cv.aucB1.4 <- NULL
+cv.paucB1.4 <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B1.4[[fold]] <- glm(formula(Model_B1.4),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB1.4[[fold]] <- predict(cv.B1.4[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB1.4[fold] <- roc.curve(scores.class0 = cv.pB1.4[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB1.4[fold] <- pr.curve(scores.class0 = cv.pB1.4[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB1.4) %>% round(4)
+# mean = 0.7438
+
+cv.aucB1.4 %>% range %>% round(4)
+
+sd(cv.aucB1.4) %>% round(4)
+# Standard Deviation = 0.0539
+```
+
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB1.4) %>% round(4)
+# mean = 0.1134
+
+cv.paucB1.4 %>% range %>% round(4)
+
+sd(cv.paucB1.4) %>% round(4)
+# sd = 0.0485
+```
+
+The B4 only model has even lower mean AUC than the B3 only, with a mean AUC of 0.1134. This would lead me to believe two things:
+
+1. Having **any** form of dynamic data does in fact increase the model effectivity. Even in the worst model of B4 only, the mean AUC was 0.1134, compared to the static only model with a mean AUC of 0.0415
+2. There is a difference in the quality of each bin of data - whether this is a direct consequence of the data itself or an actual property of the biomarkers is yet to be explored.
+
+
+# Categorizing O2S
+
+We move forward by going back to the framework of adding bins one at a time, this time with a modififying the O2S variable as categorical rather than continuous. Based on consultations I had with a peer who works as a doctor, what they generally consider as alarming levels of O2S are any values below **90-92**. Further, online resources from the **Mayo Clinic** (mayoclinic.org) state that normal readings range inside 95-100%, with readings below 90% considered as low. From this, I'd want to try to categorize O2S as either OK or Low based on a 90% threshold. Below, we look at how many would fall into each group among all the observations of O2S.
+
+I refrain from trying to get confidence intervals based on the data and categorizing it based on that since we're not necessarily looking for things that are "odd" in the data, but trying to categorize it in a manner that is independent of whatever may have happened in the data itself, similar to how one might categorize BMI based on industry benchmarks.
+
+```{r}
+O2S.vals <- data[,c("O2S.1", "O2S.2", "O2S.3", "O2S.4")]
+# 14144 patients x 4 bins = 56,576 total entries
+
+(O2S.vals < 90) %>% table
+# At a threshold of 90, only 378 entries would be in the "low" category
+
+(O2S.vals < 91) %>% table
+# At a threshold of 91, only 378 entries would be in the "low" category
+
+(O2S.vals < 92) %>% table
+# At a threshold of 92, only 937 entries would be in the "low" category
+
+(O2S.vals < 95) %>% table
+# At a threshold of 95, only 6559 entries would be in the "low" category
+
+```
+
+We're faced with a choice between what different thresholds of interest. Normal uneventful mesasurements are said to be between 95-100, which would indicate that those below 95 would already be notable. Meanwhile, sources consistently state that "low" O2S are those below the 90-92 threshold. Since this categorization can be easily changed later, we go with the most stringent one, hoping it'll help us discriminate cases vs non-cases, and use a 90 threshold.
+
+```{r results = 'hide'}
+
+O2S.cat <- (O2S.vals < 90)
+
+data$O2S.cat1 <- O2S.cat[,1] %>% factor(labels = c('OK', 'LOW'))
+data$O2S.cat2 <- O2S.cat[,2] %>% factor(labels = c('OK', 'LOW'))
+data$O2S.cat3 <- O2S.cat[,3] %>% factor(labels = c('OK', 'LOW'))
+data$O2S.cat4 <- O2S.cat[,4] %>% factor(labels = c('OK', 'LOW'))
+
+data
+```
+
+# Models
+
+We focus on stepwise selection as our algorithm of choice.
+
+## S+B1
+
+```{r}
+FULL_MODEL_B1c <- glm(case ~ age + gender + service + race +
+                      HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.cat1,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B1c)
+```
+
+### Model Selection
+
+```{r}
+STEP_B1c <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B1c),
+                    direction = "both")
+```
+
+The stepwise selection used all variables except for RR.1, with an AIC of 1826.76.
+
+### Validation
+
+```{r}
+Model_B1c <- glm(case ~ SBP.1 + HR.1 + service + O2S.cat1 + age + DBP.1 + RR.1,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B1c)
+```
+
+We note that the O2S cat variable is coming out as s=highly significant.
+
+```{r}
+testpred_B1c <- predict(Model_B1c, newdata = data[-train.idx,],
+                           type = 'response')
+
+```
+
+
+
+```{r}
+roc_B1c <- roc.curve(scores.class0 = testpred_B1c,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B1c)
+```
+
+
+
+```{r}
+pr_B1c <- pr.curve(scores.class0 = testpred_B1c,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1)
+```
+
+## 10-Fold CV
+
+```{r}
+cv.B1c <- NULL
+cv.pB1c <- NULL
+cv.aucB1c <- NULL
+cv.paucB1c <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B1c[[fold]] <- glm(formula(Model_B1c),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB1c[[fold]] <- predict(cv.B1c[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB1c[fold] <- roc.curve(scores.class0 = cv.pB1c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB1c[fold] <- pr.curve(scores.class0 = cv.pB1c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB1c) %>% round(4)
+# mean = 0.7788
+
+cv.aucB1c %>% range %>% round(4)
+
+sd(cv.aucB1c) %>% round(4)
+# Standard Deviation = 0.0579
+```
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB1c) %>% round(4)
+# mean = 0.1858
+
+cv.paucB1c %>% range %>% round(4)
+
+sd(cv.paucB1c) %>% round(4)
+# sd = 0.0652
+```
+
+The AUC of the model containing O2S data for the first bin is comparable to those that contain information for B3 and B4 already, so this seems good.
+
+## S+B1+B2
+
+```{r}
+FULL_MODEL_B2c <- glm(case ~ age + gender + service + race +
+                      HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.cat1 +
+                        HR.2 + SBP.2 + DBP.2 + RR.2 + O2S.cat2,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B2c)
+```
+
+### Model Selection
+
+```{r}
+STEP_B2c <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B2c),
+                    direction = "both")
+```
+
+The stepwise selection used all variables except for RR.1, RR.2, and DBP.2, with an AIC of 1817.4.
+
+### Validation
+
+```{r}
+Model_B2c <- glm(case ~ SBP.2 + service + HR.1 + O2S.cat1 + age + RR.1 + O2S.cat2 + 
+    SBP.1 + HR.2 + DBP.1 + DBP.2,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B2c)
+```
+
+
+```{r}
+testpred_B2c <- predict(Model_B2c, newdata = data[-train.idx,],
+                           type = 'response')
+
+```
+
+
+
+```{r}
+roc_B2c <- roc.curve(scores.class0 = testpred_B2c,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B2c)
+```
+
+
+
+```{r}
+pr_B2c <- pr.curve(scores.class0 = testpred_B2c,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1)
+```
+
+## 10-Fold CV
+
+```{r}
+cv.B2c <- NULL
+cv.pB2c <- NULL
+cv.aucB2c <- NULL
+cv.paucB2c <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B2c[[fold]] <- glm(formula(Model_B2c),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB2c[[fold]] <- predict(cv.B2c[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB2c[fold] <- roc.curve(scores.class0 = cv.pB2c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB2c[fold] <- pr.curve(scores.class0 = cv.pB2c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB2c) %>% round(4)
+# mean = 0.7877
+
+cv.aucB2c %>% range %>% round(4)
+
+sd(cv.aucB2c) %>% round(4)
+# Standard Deviation = 0.0538
+```
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB2c) %>% round(4)
+# mean = 0.1888
+
+cv.paucB2c %>% range %>% round(4)
+
+sd(cv.paucB2c) %>% round(4)
+# sd = 0.0588
+```
+
+## S+B1..3
+
+
+```{r}
+FULL_MODEL_B3c <- glm(case ~ age + gender + service + race +
+                      HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.cat1 +
+                        HR.2 + SBP.2 + DBP.2 + RR.2 + O2S.cat2 +
+                        HR.3 + SBP.3 + DBP.3 + RR.3 + O2S.cat3,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B3c)
+```
+
+### Model Selection
+
+```{r}
+STEP_B3c <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B3c),
+                    direction = "both")
+```
+
+The stepwise used the formula case ~ SBP.1 + service + O2S.cat1 + HR.3 + age + RR.3 + race + HR.1 + DBP.1 + gender + SBP.2 + O2S.cat2, with an AIC of 1804.76. We note that O2S for B3 was not used.
+
+### Validation
+
+```{r}
+Model_B3c <- glm(case ~ SBP.2 + service + HR.1 + O2S.cat1 + age + O2S.cat3 + RR.1 + 
+    HR.3 + SBP.1 + DBP.1 + DBP.2,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B3c)
+```
+
+
+```{r}
+testpred_B3c <- predict(Model_B3c, newdata = data[-train.idx,],
+                           type = 'response')
+
+```
+
+
+
+```{r}
+roc_B3c <- roc.curve(scores.class0 = testpred_B3c,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B3c)
+```
+
+
+
+```{r}
+pr_B3c <- pr.curve(scores.class0 = testpred_B3c,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1)
+```
+
+## 10-Fold CV
+
+```{r}
+cv.B3c <- NULL
+cv.pB3c <- NULL
+cv.aucB3c <- NULL
+cv.paucB3c <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B3c[[fold]] <- glm(formula(Model_B3c),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB3c[[fold]] <- predict(cv.B3c[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB3c[fold] <- roc.curve(scores.class0 = cv.pB3c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB3c[fold] <- pr.curve(scores.class0 = cv.pB3c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB3c) %>% round(4)
+# mean = 0.7896
+
+cv.aucB3c %>% range %>% round(4)
+
+sd(cv.aucB3c) %>% round(4)
+# Standard Deviation = 0.0549
+```
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB3c) %>% round(4)
+# mean = 0.1886
+
+cv.paucB3c %>% range %>% round(4)
+
+sd(cv.paucB3c) %>% round(4)
+# sd = 0.0507
+```
+
+## S+B1..4
+
+```{r}
+FULL_MODEL_B4c <- glm(case ~ age + gender + service + race +
+                      HR.1 + SBP.1 + DBP.1 + RR.1 + O2S.cat1 +
+                        HR.2 + SBP.2 + DBP.2 + RR.2 + O2S.cat2 +
+                        HR.3 + SBP.3 + DBP.3 + RR.3 + O2S.cat3 +
+                        HR.4 + SBP.4 + DBP.4 + RR.4 + O2S.cat4,
+                    data = data[train.idx,],
+                    family = "binomial")
+
+summary(FULL_MODEL_B4c)
+```
+
+### Model Selection
+
+```{r}
+STEP_B4c <- stepAIC(NULL_MODEL,
+                   scope = formula(FULL_MODEL_B4c),
+                    direction = "both")
+```
+
+The stepwise used the formula case ~ SBP.1 + service + O2S.cat1 + HR.3 + age + RR.3 + race + HR.1 + DBP.1 + gender + SBP.2 + O2S.cat4, with an AIC of 1804.71. Note that the new AIC is just a very marginal improvement over the B3 one.
+
+### Validation
+
+```{r}
+Model_B4c <- glm(case ~ SBP.2 + service + HR.4 + O2S.cat1 + age + SBP.4 + O2S.cat3 + 
+    RR.1 + HR.1 + DBP.2 + DBP.1,
+                data = data[train.idx,],
+                family = "binomial")
+
+summary(Model_B4c)
+```
+
+
+```{r}
+testpred_B4c <- predict(Model_B4c, newdata = data[-train.idx,],
+                           type = 'response')
+
+```
+
+
+
+```{r}
+roc_B4c <- roc.curve(scores.class0 = testpred_B4c,
+                        weights.class0 = data$case[-train.idx],
+                        curve = TRUE)
+plot(roc_B4c)
+```
+
+
+
+```{r}
+pr_B4c <- pr.curve(scores.class0 = testpred_B4c,
+                      weights.class0 = data$case[-train.idx],
+                      curve = T)
+plot(pr_B1)
+```
+
+### 10-Fold CV
+
+```{r}
+cv.B4c <- NULL
+cv.pB4c <- NULL
+cv.aucB4c <- NULL
+cv.paucB4c <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.B4c[[fold]] <- glm(formula(Model_B4c),  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.pB4c[[fold]] <- predict(cv.B4c[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucB4c[fold] <- roc.curve(scores.class0 = cv.pB4c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucB4c[fold] <- pr.curve(scores.class0 = cv.pB4c[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+We look at the AUC's from the ROC.
+
+```{r}
+mean(cv.aucB4c) %>% round(4)
+# mean = 0.7888
+
+cv.aucB4c %>% range %>% round(4)
+
+sd(cv.aucB4c) %>% round(4)
+# Standard Deviation = 0.0562
+```
+
+And for PR-AUC:
+
+```{r}
+mean(cv.paucB4c) %>% round(4)
+# mean = 0.1889
+
+cv.paucB4c %>% range %>% round(4)
+
+sd(cv.paucB4c) %>% round(4)
+# sd = 0.0499
+```
+
+# Summary of Models
+
+Below, we show a table that presents the mean CV-AUC of each model built, as well as the Standard Deviation of the AUC's for the cross validations. As a legend (using x as a variable):
+
+*S+Bx: Static + bin X only
+*S..Bx: Static + bin 1 to x only
+*Bxc : Static + Bin 1 to x only, with categorized O2s
+
+```{r}
+data.frame(Model = c('Static',
+                     'S+B1', 'S+B2', 'S+B3', 'S+B4',
+                     'S..B2', 'S..B3', 'S..B4',
+                     'B1c', 'B2c', 'B3c', 'B4c'),
+           PR_AUC = c(0.0415,
+                   0.1756, 0.1780, 0.1440, 0.1134,
+                   0.1806, 0.1818, 0.1827,
+                   0.1858, 0.1888, 0.1886, 0.1889),
+           sd_AUC = c(0.0213,
+                       0.0615, 0.0558, 0.0496, 0.0485,
+                       0.0696, 0.0569, 0.0649,
+                       0.0657, 0.0588, 0.0507, 0.0499))
+```
+
+Conceptually, the best model would combine a good (high) AUC along with a low standard devation. Conveniently, model B4c has the highest AUC at 0.1889, as well as a relatively low standard deviation of 0.0499, which might point us toward choosing this as a model. Below, for reference is the summary of this model.
+
+```{r}
+summary(Model_B4c)
+```
+
+
+
+# Get Logistic Cohort
+
+```{r eval=FALSE}
+data.path <- "D:/DISSERTATION ACTION/RAW DATA (PREPROCESSED)/Logistic Data"
+setwd(data.path)  
+
+saveRDS(data$icustay_id, file = "final_cohort.RDS")
+```
+
+
+
+
+
+# Univariate Models for comparison with Joints
+# We fit the univariate models
+
+We just do cross validations for these ones
+
+```{r}
+cv.uniSBP <- NULL
+cv.puniSBP <- NULL
+cv.aucuniSBP <- NULL
+cv.paucuniSBP <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.uniSBP[[fold]] <- glm(case ~ age + gender + service + race +
+                            SBP.1 + SBP.2 + SBP.3 + SBP.4,  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.puniSBP[[fold]] <- predict(cv.uniSBP[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucuniSBP[fold] <- roc.curve(scores.class0 = cv.puniSBP[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucuniSBP[fold] <- pr.curve(scores.class0 = cv.puniSBP[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+```{r}
+cv.uniDBP <- NULL
+cv.puniDBP <- NULL
+cv.aucuniDBP <- NULL
+cv.paucuniDBP <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.uniDBP[[fold]] <- glm(case ~ age + gender + service + race +
+                            DBP.1 + DBP.2 + DBP.3 + DBP.4,  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.puniDBP[[fold]] <- predict(cv.uniDBP[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucuniDBP[fold] <- roc.curve(scores.class0 = cv.puniDBP[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucuniDBP[fold] <- pr.curve(scores.class0 = cv.puniDBP[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+```{r}
+cv.uniO2S <- NULL
+cv.puniO2S <- NULL
+cv.aucuniO2S <- NULL
+cv.paucuniO2S <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.uniO2S[[fold]] <- glm(case ~ age + gender + service + race +
+                            O2S.1 + O2S.2 + O2S.3 + O2S.4,  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.puniO2S[[fold]] <- predict(cv.uniO2S[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucuniO2S[fold] <- roc.curve(scores.class0 = cv.puniO2S[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucuniO2S[fold] <- pr.curve(scores.class0 = cv.puniO2S[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+
+cv.uniO2S[[1]]
+```
+
+```{r}
+cv.uniRR <- NULL
+cv.puniRR <- NULL
+cv.aucuniRR <- NULL
+cv.paucuniRR <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.uniRR[[fold]] <- glm(case ~ age + gender + service + race +
+                            RR.1 + RR.2 + RR.3 + RR.4,  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.puniRR[[fold]] <- predict(cv.uniRR[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucuniRR[fold] <- roc.curve(scores.class0 = cv.puniRR[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucuniRR[fold] <- pr.curve(scores.class0 = cv.puniRR[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+```{r}
+cv.uniHR <- NULL
+cv.puniHR <- NULL
+cv.aucuniHR <- NULL
+cv.paucuniHR <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.uniHR[[fold]] <- glm(case ~ age + gender + service + race +
+                            HR.1 + HR.2 + HR.3 + HR.4,  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.puniHR[[fold]] <- predict(cv.uniHR[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucuniHR[fold] <- roc.curve(scores.class0 = cv.puniHR[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucuniHR[fold] <- pr.curve(scores.class0 = cv.puniHR[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+```{r}
+cv.uniHR <- NULL
+cv.puniHR <- NULL
+cv.aucuniHR <- NULL
+cv.paucuniHR <- NULL
+
+for(fold in 1:n.folds){
+  cv.train.idx <- setdiff(1:nrow(data), folds[[fold]])  # get training indices
+  cv.uniHR[[fold]] <- glm(case ~ age + gender + service + race +
+                            HR.1 + HR.2 + HR.3 + HR.4,  # fit model
+                       data = data, subset = cv.train.idx,
+                       family = "binomial")
+  
+  # Perform testing
+  test.idx <- folds[[fold]]
+  cv.puniHR[[fold]] <- predict(cv.uniHR[[fold]], newdata = data[test.idx,],
+                                type = 'response')
+  cv.aucuniHR[fold] <- roc.curve(scores.class0 = cv.puniHR[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc
+  cv.paucuniHR[fold] <- pr.curve(scores.class0 = cv.puniHR[[fold]],
+                                  weights.class0 = data$case[test.idx])$auc.integral
+}
+```
+
+
+# uniV metrics
+
+## HR
+
+```{r}
+mean(cv.paucuniHR) %>% round(4)
+sd(cv.paucuniHR) %>% round(4)
+```
+
+## SBP
+
+```{r}
+mean(cv.paucuniSBP) %>% round(4)
+sd(cv.paucuniSBP) %>% round(4)
+```
+
+## DBP
+
+```{r}
+mean(cv.paucuniDBP) %>% round(4)
+sd(cv.paucuniDBP) %>% round(4)
+```
+
+## RR
+
+```{r}
+mean(cv.paucuniRR) %>% round(4)
+sd(cv.paucuniRR) %>% round(4)
+```
+
+# O2S
+
+```{r}
+mean(cv.paucuniO2S) %>% round(4)
+sd(cv.paucuniO2S) %>% round(4)
+```
+
+
+```{r}
+(169/(169+13944)) %>% round(4)
+```
+
+# CHosen model B1.3
+
+```{r}
+summary(Model_B1.3)
+```
+
+```{r}
+help(glm)
+```
+
+```{r}
+exp(summary(Model_B1.3)$coef) %>% round(4)
+```
+
+```{r}
+mean(data$age)
+```
+
+```{r}
+plot(Model_B1.3)
+```
+
+

@@ -1,0 +1,1491 @@
+---
+title: "Joint Models"
+author: "Kevin Maske"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+      code_folding: hide
+      toc: true
+      toc_float: 
+        collapsed: false
+      number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(JM)
+library(tidyverse)
+library(data.table)
+library(caret)
+library(PRROC)
+library(pROC)
+library(parallel)
+library(doParallel)
+library(foreach)
+
+cl <- makeCluster(5)
+registerDoParallel(cl)
+```
+
+# Introduction
+
+In this module, we will proceed to fit single-dynamic variable joint models, and test their predictive power. In particular, we focus on each model's ability to discriminate between cases and controls at various points in time in the study. We will use cross-validation methods in coordination with the ROC functions offered by the JM package.
+
+```{r}
+data.path <- "D:/DISSERTATION ACTION/RAW DATA (PREPROCESSED)/BetterData"
+setwd(data.path)
+
+# load("JM_Data1.RData")
+# JM_Static <- readRDS("LogisticDataD.rds")
+#load("NA_DYNAMIC.RData")  # From the previous file
+
+load("MIMIC_JM_Results_1.RData")
+load("MIMIC_JM_Results_2.RData")
+load("MIMIC_JM_Results_3.RData")
+```
+
+Each of the data sets loaded contains, in long format, measurements of the associated variable per patient, as well as their static variables (sex, service, age, weight, race). We specify folds and divisions that will be used for all testing now. We will make use of stratified sampling in order to ensure each cut has similar amounts of cases and controls.
+
+```{r DataCuts, eval = FALSE}
+# Obtain icustay_id's of the controls and cases
+N <- nrow(JM_Static)
+
+controls <- JM_Static %>% filter(!(icustay_id %in% death72$icustay_id))
+
+# 80-20 for initial study, 10-fold CV later on
+set.seed(1)
+train.id.case <- createDataPartition(death72$icustay_id, p=0.8)$Resample1
+train.id.ctrl <- createDataPartition(as.integer(controls$icustay_id), p=0.8)$Resample1
+train.id <- c(death72$icustay_id[train.id.case],
+              controls$icustay_id[train.id.ctrl])  # 80% training set
+test.id <- setdiff(JM_Static$icustay_id, train.id)  # 20% development set
+
+set.seed(2)
+caseFolds <- createFolds(death72$icustay_id, k = 5)
+ctrlFolds <- createFolds(controls$icustay_id, k = 5)
+
+k = 5
+random.classifier.prauc <- length(train.id.case)/length(train.id)
+```
+
+```{r}
+random.classifier.prauc = 169/14113
+```
+
+# Models
+
+## Heart Rate
+
+We begin by specifying a model that will be built using the 80% training data. Of course, I forgot to attatch whether or not the person was a case to the dataset, so let me do that now.
+
+```{r eval = FALSE}
+# Attaching case or not to static dataset
+case <- rep(0, nrow(JM_HR_long))
+case[which(JM_HR_long$icustay_id %in% death72$icustay_id)] = 1
+JM_HR_long$death <- case
+JM_HR_long$Time <- JM_HR_long$'T'  # add a duplicate, better named column to avoid issues
+
+survTable.HR <- JM_HR_long[!duplicated(JM_HR_long$icustay_id),]
+```
+
+```{r eval = FALSE}
+# We work with the training data first, we use most default settings for most of this
+  set.seed(1)
+  lme.HR <- lme(val ~ obstime,
+                random = ~ obstime | icustay_id,
+                data = filter(JM_HR_long,  # Get only those in the training set
+                              icustay_id %in% train.id))
+  
+  # We specify all our static variables
+  cox.HR <- coxph(Surv(Time, death) ~ gender + race + service + age,
+                  data = filter(survTable.HR,
+                                icustay_id %in% train.id),
+                  x = TRUE)
+  
+  # Fit the joint model
+  
+  jointHR <- jointModel(lme.HR,
+                        cox.HR,
+                        timeVar = 'obstime',
+                        method = 'spline-PH-aGH')
+  # We select the smoother spline method for baseline risk.
+```
+  
+```{r}
+summary(jointHR)
+```
+
+```{r}
+exp(0.0241)
+exp(0.0448)
+```
+
+Based on the above results, the following were found (based on the Wald statistics computed) to be significant variables in the joint models:
+
+* Assoct (That is, the longitudinal variable in question),
+* Age
+* Service-Traum
+
+Since our main focus is the dynamic variables, we'll back off on the interpretation for the static variables (interpretation will be similar to the types found for the logistic study, except this time the coefficients aren't just additive, but multiplicative in nature due to proportional hazards).
+
+The heart rate seems to have been significant at a very high level, with a coefficient of **0.0481.** This indicates that a unit increase in heart rate corresponds to a exp(0.0492) = 1.05-fold increase in the risk of death, with the xi's giving the spline baseline risk for the periods in time where there were observed deaths.
+
+Note that while using the aucJM function, we set simulation to FALSE. While we could be interested in the distribution of AUC's for individual patients, the computation for datasets this large quickly become unreasonably large. Thus, we use only the first order estimates of survival probabilities; granted that we have a large number of patients in the validation set, we use those to get our summary statistics. Monte Carlo methods could be more appropriate if we were looking at individual patients only, rather than large groups. Note that the aucJM function takes in a Tstart argument: the argument indicates the time point up to which longitudinal data will be considered.
+
+** There are some strange things going on with the aucJM (returning "subscript out of bounds" error for times usually rows where a new subject is entered). To circumvent this issue, we instead aim to construct the AUC's ourselves - we get sruvival probabilities for the 72-hour mark, and use our usual ROC and PR curves from the packages we used in the logistic method to determine predictive power. **
+
+
+```{r eval = FALSE}
+test.HR <- filter(JM_HR_long, icustay_id %in% test.id)
+
+HR.pred <- ((survfitJM(jointHR,
+                     newdata = test.HR,
+                     idVar = 'icustay_id',
+                     simulate = FALSE,
+                     survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+# c(FALSE, TRUE) removes odd-indexed entries, which is fine because in the unlisted
+# version, the odd entries just contain 72, the survTimes. We are interested in the
+# predicted survival probabilities, which are in the even entries.
+
+# the fitting is still incredibly slow. but at least it actually finishes, unlike the previous rocJM and aucJM codes. Along with the model fitting itself being incredibly slow, is cross validation even a viable process?
+
+validation.HR <- data.frame(icustay_id = unique(test.HR$icustay_id),
+                            caseProb = 1 - HR.pred,
+                            case = 0)
+
+validation.HR$case[which(validation.HR$icustay_id %in% death72$icustay_id)] <- 1
+```
+
+We take a look at the ROC curve.
+```{r}
+roc.HR <- roc.curve(scores.class0 = validation.HR$caseProb,
+                    weights.class0 = validation.HR$case,
+                    curve = TRUE)
+
+
+plot(roc.HR)
+
+
+```
+
+ROC-AUC: 0.8598
+
+
+```{r}
+pr.HR <- pr.curve(scores.class0 = validation.HR$caseProb,
+                  weights.class0 = validation.HR$case,
+                  curve = TRUE)
+
+plot(pr.HR)
+```
+
+PR-AUC: 0.0744
+
+```{r}
+(pr.HR$auc.integral / random.classifier.prauc) %>% round(2)
+```
+
+
+Recalling that the random classifier would have an AUC of around 1.63%, we see that the joint model containing heart rate has an AUC that is around 6.08x what a random classifier would have, indicating some measure of improvement. Still, we notice that this is not on par with the classifying power of the models we tested with our logistic models, but we also understand that here, we're looking only at one variable at a time. It is, then, perhaps of interest to us to see how each variable compares individually.
+
+## O2S
+
+```{r eval = FALSE}
+# Attaching case or not to static dataset
+case <- rep(0, nrow(JM_O2S_long))
+case[which(JM_O2S_long$icustay_id %in% death72$icustay_id)] = 1
+JM_O2S_long$death <- case
+JM_O2S_long$Time <- JM_O2S_long$'T'  # add a duplicate, better named column to avoid issues
+
+survTable.O2S <- JM_O2S_long[!duplicated(JM_O2S_long$icustay_id),]
+```
+
+```{r eval = FALSE}
+# We work with the training data first, we use most default settings for most of this
+  set.seed(1)
+  lme.O2S <- lme(val ~ obstime,
+                random = ~ obstime | icustay_id,
+                data = filter(JM_O2S_long,  # Get only those in the training set
+                              icustay_id %in% train.id))
+  
+  # We specify all our static variables
+  cox.O2S <- coxph(Surv(Time, death) ~ gender + race + service + age,
+                  data = filter(survTable.O2S,
+                                icustay_id %in% train.id),
+                  x = TRUE)
+  
+  # Fit the joint model
+  
+  jointO2S <- jointModel(lme.O2S,
+                        cox.O2S,
+                        timeVar = 'obstime',
+                        method = 'spline-PH-aGH')
+  # We select the smoother spline method for baseline risk.
+```
+  
+```{r}
+summary(jointO2S)
+```
+
+
+```{r eval = FALSE}
+test.O2S <- filter(JM_O2S_long, icustay_id %in% test.id)
+
+O2S.pred <- ((survfitJM(jointO2S,
+                     newdata = test.O2S,
+                     idVar = 'icustay_id',
+                     simulate = FALSE,
+                     survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+# c(FALSE, TRUE) removes odd-indexed entries, which is fine because in the unlisted
+# version, the odd entries just contain 72, the survTimes. We are interested in the
+# predicted survival probabilities, which are in the even entries.
+
+# the fitting is still incredibly slow. but at least it actually finishes, unlike the previous rocJM and aucJM codes. Along with the model fitting itself being incredibly slow, is cross validation even a viable process?
+
+validation.O2S <- data.frame(icustay_id = unique(test.O2S$icustay_id),
+                            caseProb = 1 - O2S.pred,
+                            case = 0)
+
+validation.O2S$case[which(validation.O2S$icustay_id %in% death72$icustay_id)] <- 1
+```
+
+We take a look at the ROC curve.
+```{r}
+roc.O2S <- roc.curve(scores.class0 = validation.O2S$caseProb,
+                    weights.class0 = validation.O2S$case,
+                    curve = TRUE)
+
+
+plot(roc.O2S)
+
+
+```
+
+ROC-AUC: 0.8598
+
+
+```{r}
+pr.O2S <- pr.curve(scores.class0 = validation.O2S$caseProb,
+                  weights.class0 = validation.O2S$case,
+                  curve = TRUE)
+
+plot(pr.O2S)
+```
+
+PR-AUC: 0.0744
+
+```{r}
+(pr.O2S$auc.integral / random.classifier.prauc) %>% round(2)
+```
+
+
+
+## RR
+
+```{r eval = FALSE}
+# Attaching case or not to static dataset
+case <- rep(0, nrow(JM_RR_long))
+case[which(JM_RR_long$icustay_id %in% death72$icustay_id)] = 1
+JM_RR_long$death <- case
+JM_RR_long$Time <- JM_RR_long$'T'  # add a duplicate, better named column to avoid issues
+
+survTable.RR <- JM_RR_long[!duplicated(JM_RR_long$icustay_id),]
+```
+
+```{r eval = FALSE}
+# We work with the training data first, we use most default settings for most of this
+  set.seed(1)
+  lme.RR <- lme(val ~ obstime,
+                random = ~ obstime | icustay_id,
+                data = filter(JM_RR_long,  # Get only those in the training set
+                              icustay_id %in% train.id))
+  
+  # We specify all our static variables
+  cox.RR <- coxph(Surv(Time, death) ~ gender + race + service + age,
+                  data = filter(survTable.RR,
+                                icustay_id %in% train.id),
+                  x = TRUE)
+  
+  # Fit the joint model
+  
+  jointRR <- jointModel(lme.RR,
+                        cox.RR,
+                        timeVar = 'obstime',
+                        method = 'spline-PH-aGH')
+  # We select the smoother spline method for baseline risk.
+```
+  
+```{r}
+summary(jointRR)
+```
+
+
+```{r eval = FALSE}
+test.RR <- filter(JM_RR_long, icustay_id %in% test.id)
+
+RR.pred <- ((survfitJM(jointRR,
+                     newdata = test.RR,
+                     idVar = 'icustay_id',
+                     simulate = FALSE,
+                     survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+# c(FALSE, TRUE) removes odd-indexed entries, which is fine because in the unlisted
+# version, the odd entries just contain 72, the survTimes. We are interested in the
+# predicted survival probabilities, which are in the even entries.
+
+# the fitting is still incredibly slow. but at least it actually finishes, unlike the previous rocJM and aucJM codes. Along with the model fitting itself being incredibly slow, is cross validation even a viable process?
+
+validation.RR <- data.frame(icustay_id = unique(test.RR$icustay_id),
+                            caseProb = 1 - RR.pred,
+                            case = 0)
+
+validation.RR$case[which(validation.RR$icustay_id %in% death72$icustay_id)] <- 1
+```
+
+We take a look at the ROC curve.
+```{r}
+roc.RR <- roc.curve(scores.class0 = validation.RR$caseProb,
+                    weights.class0 = validation.RR$case,
+                    curve = TRUE)
+
+
+plot(roc.RR)
+
+
+```
+
+ROC-AUC: 0.8598
+
+
+```{r}
+pr.RR <- pr.curve(scores.class0 = validation.RR$caseProb,
+                  weights.class0 = validation.RR$case,
+                  curve = TRUE)
+
+plot(pr.RR)
+```
+
+PR-AUC: 0.0744
+
+```{r}
+(pr.RR$auc.integral / random.classifier.prauc) %>% round(2)
+```
+
+## SBP
+
+```{r eval = FALSE}
+# Attaching case or not to static dataset
+case <- rep(0, nrow(JM_SBP_long))
+case[which(JM_SBP_long$icustay_id %in% death72$icustay_id)] = 1
+JM_SBP_long$death <- case
+JM_SBP_long$Time <- JM_SBP_long$'T'  # add a duplicate, better named column to avoid issues
+
+survTable.SBP <- JM_SBP_long[!duplicated(JM_SBP_long$icustay_id),]
+```
+
+```{r eval = FALSE}
+# We work with the training data first, we use most default settings for most of this
+  set.seed(1)
+  lme.SBP <- lme(val ~ obstime,
+                random = ~ obstime | icustay_id,
+                data = filter(JM_SBP_long,  # Get only those in the training set
+                              icustay_id %in% train.id))
+  
+  # We specify all our static variables
+  cox.SBP <- coxph(Surv(Time, death) ~ gender + race + service + age,
+                  data = filter(survTable.SBP,
+                                icustay_id %in% train.id),
+                  x = TRUE)
+  
+  # Fit the joint model
+  
+  jointSBP <- jointModel(lme.SBP,
+                        cox.SBP,
+                        timeVar = 'obstime',
+                        method = 'spline-PH-aGH')
+  # We select the smoother spline method for baseline risk.
+```
+  
+```{r}
+summary(jointSBP)
+```
+
+
+```{r eval = FALSE}
+test.SBP <- filter(JM_SBP_long, icustay_id %in% test.id)
+
+SBP.pred <- ((survfitJM(jointSBP,
+                     newdata = test.SBP,
+                     idVar = 'icustay_id',
+                     simulate = FALSE,
+                     survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+# c(FALSE, TRUE) removes odd-indexed entries, which is fine because in the unlisted
+# version, the odd entries just contain 72, the survTimes. We are interested in the
+# predicted survival probabilities, which are in the even entries.
+
+# the fitting is still incredibly slow. but at least it actually finishes, unlike the previous rocJM and aucJM codes. Along with the model fitting itself being incredibly slow, is cross validation even a viable process?
+
+validation.SBP <- data.frame(icustay_id = unique(test.SBP$icustay_id),
+                            caseProb = 1 - SBP.pred,
+                            case = 0)
+
+validation.SBP$case[which(validation.SBP$icustay_id %in% death72$icustay_id)] <- 1
+```
+
+We take a look at the ROC curve.
+```{r}
+roc.SBP <- roc.curve(scores.class0 = validation.SBP$caseProb,
+                    weights.class0 = validation.SBP$case,
+                    curve = TRUE)
+
+
+plot(roc.SBP)
+
+
+```
+
+ROC-AUC: 0.8598
+
+
+```{r}
+pr.SBP <- pr.curve(scores.class0 = validation.SBP$caseProb,
+                  weights.class0 = validation.SBP$case,
+                  curve = TRUE)
+
+plot(pr.SBP)
+```
+
+PR-AUC: 0.0744
+
+```{r}
+(pr.SBP$auc.integral / random.classifier.prauc) %>% round(2)
+```
+
+## DBP
+
+```{r eval = FALSE}
+# Attaching case or not to static dataset
+case <- rep(0, nrow(JM_DBP_long))
+case[which(JM_DBP_long$icustay_id %in% death72$icustay_id)] = 1
+JM_DBP_long$death <- case
+JM_DBP_long$Time <- JM_DBP_long$'T'  # add a duplicate, better named column to avoid issues
+
+survTable.DBP <- JM_DBP_long[!duplicated(JM_DBP_long$icustay_id),]
+```
+
+```{r eval = FALSE}
+# We work with the training data first, we use most default settings for most of this
+  set.seed(1)
+  lme.DBP <- lme(val ~ obstime,
+                random = ~ obstime | icustay_id,
+                data = filter(JM_DBP_long,  # Get only those in the training set
+                              icustay_id %in% train.id))
+  
+  # We specify all our static variables
+  cox.DBP <- coxph(Surv(Time, death) ~ gender + race + service + age,
+                  data = filter(survTable.DBP,
+                                icustay_id %in% train.id),
+                  x = TRUE)
+  
+  # Fit the joint model
+  
+  jointDBP <- jointModel(lme.DBP,
+                        cox.DBP,
+                        timeVar = 'obstime',
+                        method = 'spline-PH-aGH')
+  # We select the smoother spline method for baseline risk.
+```
+  
+```{r}
+summary(jointDBP)
+```
+
+
+```{r eval = FALSE}
+test.DBP <- filter(JM_DBP_long, icustay_id %in% test.id)
+
+DBP.pred <- ((survfitJM(jointDBP,
+                     newdata = test.DBP,
+                     idVar = 'icustay_id',
+                     simulate = FALSE,
+                     survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+# c(FALSE, TRUE) removes odd-indexed entries, which is fine because in the unlisted
+# version, the odd entries just contain 72, the survTimes. We are interested in the
+# predicted survival probabilities, which are in the even entries.
+
+# the fitting is still incredibly slow. but at least it actually finishes, unlike the previous rocJM and aucJM codes. Along with the model fitting itself being incredibly slow, is cross validation even a viable process?
+
+validation.DBP <- data.frame(icustay_id = unique(test.DBP$icustay_id),
+                            caseProb = 1 - DBP.pred,
+                            case = 0)
+
+validation.DBP$case[which(validation.DBP$icustay_id %in% death72$icustay_id)] <- 1
+```
+
+We take a look at the ROC curve.
+```{r}
+roc.DBP <- roc.curve(scores.class0 = validation.DBP$caseProb,
+                    weights.class0 = validation.DBP$case,
+                    curve = TRUE)
+
+
+plot(roc.DBP)
+
+
+```
+
+ROC-AUC: 0.8598
+
+
+```{r}
+pr.DBP <- pr.curve(scores.class0 = validation.DBP$caseProb,
+                  weights.class0 = validation.DBP$case,
+                  curve = TRUE)
+
+plot(pr.DBP)
+```
+
+PR-AUC: 0.0744
+
+```{r}
+(pr.DBP$auc.integral / random.classifier.prauc) %>% round(2)
+```
+
+# Cross-Validations
+
+We now run 5-fold cross validations on each of the datasets. First, though, since the folds created above are in terms of indices, we change those to icustay_id for ease of referencing.
+
+```{r eval = FALSE}
+folds <- NULL
+for(i in 1:5){  # 5 folds with similar distributions of cases and controls
+  folds[[i]] <- c(controls$icustay_id[ctrlFolds[[i]]],
+                  death72$icustay_id[caseFolds[[i]]])
+}
+```
+
+## HR
+
+```{r eval = FALSE}
+cv.HR.lme <- NULL
+cv.HR.cox <- NULL
+cv.HR.JM <- NULL
+cv.HR.pred <- NULL
+cv.HR.val <- NULL
+cv.HR.roc <- NULL
+cv.HR.pr <- NULL
+
+set.seed(1)
+for(fold in 1:k){
+  cv.HR.lme <- lme(val ~ obstime,
+                           random = ~ obstime | icustay_id,
+                           data = filter(JM_HR_long,
+                                         !(icustay_id %in% folds[[fold]])))
+  cv.HR.cox <- coxph(Surv(Time, death) ~ gender + race +
+                               service + age,
+                             data = filter(survTable.HR,
+                                           !(icustay_id %in% folds[[fold]])),
+                             x = TRUE)
+  cv.HR.JM <- jointModel(cv.HR.lme,
+                         cv.HR.cox,
+                         timeVar = 'obstime',
+                         method = 'spline-PH-aGH')
+  # Have it overwrite at each loop in order to conserve space
+  
+  # The model is fit above, now we make predictions.
+  cv.HR.pred[[fold]] <- ((survfitJM(cv.HR.JM,
+                            newdata = filter(JM_HR_long,
+                                             icustay_id %in% folds[[fold]]),
+                            idVar = 'icustay_id',
+                            simulate = FALSE,
+                            survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+  
+
+
+  cv.HR.val[[fold]] <- data.frame(icustay_id = unique(filter(JM_HR_long,
+                                                             (icustay_id %in% folds[[fold]]))$icustay_id),
+                                  caseProb = 1 - cv.HR.pred[[fold]],
+                                  case = 0)
+  
+  cv.HR.val[[fold]]$case[which(cv.HR.val[[fold]]$icustay_id %in%
+                                 death72$icustay_id)] <- 1
+  
+  # Get ROC and PR-AUC
+  cv.HR.roc[fold] <- roc.curve(scores.class0 = cv.HR.val[[fold]]$caseProb,
+                               weights.class0 = cv.HR.val[[fold]]$case)$auc
+  cv.HR.pr[fold] <- pr.curve(scores.class0 = cv.HR.val[[fold]]$caseProb,
+                             weights.class0 = cv.HR.val[[fold]]$case)$auc.integral
+}
+
+
+```
+
+We look at AUC summaries for both types of evaluators.
+
+```{r}
+mean(cv.HR.roc) %>% round(4)
+sd(cv.HR.roc) %>% round(4)
+
+mean(cv.HR.pr) %>% round(4)
+sd(cv.HR.pr) %>% round(4)
+```
+
+  
+## O2S
+
+```{r eval = FALSE}
+cv.O2S.lme <- NULL
+cv.O2S.cox <- NULL
+cv.O2S.JM <- NULL
+cv.O2S.pred <- NULL
+cv.O2S.val <- NULL
+cv.O2S.roc <- NULL
+cv.O2S.pr <- NULL
+
+set.seed(1)
+for(fold in 1:k){
+  cv.O2S.lme <- lme(val ~ obstime,
+                           random = ~ obstime | icustay_id,
+                           data = filter(JM_O2S_long,
+                                         !(icustay_id %in% folds[[fold]])))
+  cv.O2S.cox <- coxph(Surv(Time, death) ~ gender + race +
+                               service  + age,
+                             data = filter(survTable.O2S,
+                                           !(icustay_id %in% folds[[fold]])),
+                             x = TRUE)
+  cv.O2S.JM <- jointModel(cv.O2S.lme,
+                         cv.O2S.cox,
+                         timeVar = 'obstime',
+                         method = 'spline-PH-aGH')
+  # Have it overwrite at each loop in order to conserve space
+  
+  # The model is fit above, now we make predictions.
+  cv.O2S.pred[[fold]] <- ((survfitJM(cv.O2S.JM,
+                            newdata = filter(JM_O2S_long,
+                                             icustay_id %in% folds[[fold]]),
+                            idVar = 'icustay_id',
+                            simulate = FALSE,
+                            survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+  
+
+
+  cv.O2S.val[[fold]] <- data.frame(icustay_id = unique(filter(JM_O2S_long,
+                                                             (icustay_id %in% folds[[fold]]))$icustay_id),
+                                  caseProb = 1 - cv.O2S.pred[[fold]],
+                                  case = 0)
+  
+  cv.O2S.val[[fold]]$case[which(cv.O2S.val[[fold]]$icustay_id %in%
+                                 death72$icustay_id)] <- 1
+  
+  # Get ROC and PR-AUC
+  cv.O2S.roc[fold] <- roc.curve(scores.class0 = cv.O2S.val[[fold]]$caseProb,
+                               weights.class0 = cv.O2S.val[[fold]]$case)$auc
+  cv.O2S.pr[fold] <- pr.curve(scores.class0 = cv.O2S.val[[fold]]$caseProb,
+                             weights.class0 = cv.O2S.val[[fold]]$case)$auc.integral
+}
+
+
+```
+
+We look at AUC summaries for both types of evaluators.
+
+```{r}
+mean(cv.O2S.roc)%>% round(4)
+sd(cv.O2S.roc) %>% round(4)
+
+mean(cv.O2S.pr) %>% round(4)
+sd(cv.O2S.pr) %>% round(4)
+```
+
+## RR
+
+```{r eval = FALSE}
+cv.RR.lme <- NULL
+cv.RR.cox <- NULL
+cv.RR.JM <- NULL
+cv.RR.pred <- NULL
+cv.RR.val <- NULL
+cv.RR.roc <- NULL
+cv.RR.pr <- NULL
+
+set.seed(1)
+for(fold in 1:k){
+  cv.RR.lme <- lme(val ~ obstime,
+                           random = ~ obstime | icustay_id,
+                           data = filter(JM_RR_long,
+                                         !(icustay_id %in% folds[[fold]])))
+  cv.RR.cox <- coxph(Surv(Time, death) ~ gender + race +
+                               service  + age,
+                             data = filter(survTable.RR,
+                                           !(icustay_id %in% folds[[fold]])),
+                             x = TRUE)
+  cv.RR.JM <- jointModel(cv.RR.lme,
+                         cv.RR.cox,
+                         timeVar = 'obstime',
+                         method = 'spline-PH-aGH')
+  # Have it overwrite at each loop in order to conserve space
+  
+  # The model is fit above, now we make predictions.
+  cv.RR.pred[[fold]] <- ((survfitJM(cv.RR.JM,
+                            newdata = filter(JM_RR_long,
+                                             icustay_id %in% folds[[fold]]),
+                            idVar = 'icustay_id',
+                            simulate = FALSE,
+                            survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+  
+
+
+  cv.RR.val[[fold]] <- data.frame(icustay_id = unique(filter(JM_RR_long,
+                                                             (icustay_id %in% folds[[fold]]))$icustay_id),
+                                  caseProb = 1 - cv.RR.pred[[fold]],
+                                  case = 0)
+  
+  cv.RR.val[[fold]]$case[which(cv.RR.val[[fold]]$icustay_id %in%
+                                 death72$icustay_id)] <- 1
+  
+  # Get ROC and PR-AUC
+  cv.RR.roc[fold] <- roc.curve(scores.class0 = cv.RR.val[[fold]]$caseProb,
+                               weights.class0 = cv.RR.val[[fold]]$case)$auc
+  cv.RR.pr[fold] <- pr.curve(scores.class0 = cv.RR.val[[fold]]$caseProb,
+                             weights.class0 = cv.RR.val[[fold]]$case)$auc.integral
+}
+
+
+```
+
+We look at AUC summaries for both types of evaluators.
+
+```{r}
+mean(cv.RR.roc) %>% round(4)
+sd(cv.RR.roc) %>% round(4)
+
+mean(cv.RR.pr) %>% round(4)
+sd(cv.RR.pr) %>% round(4)
+```
+## SBP
+
+```{r eval = FALSE}
+cv.SBP.lme <- NULL
+cv.SBP.cox <- NULL
+cv.SBP.JM <- NULL
+cv.SBP.pred <- NULL
+cv.SBP.val <- NULL
+cv.SBP.roc <- NULL
+cv.SBP.pr <- NULL
+
+set.seed(1)
+for(fold in 1:k){
+  cv.SBP.lme <- lme(val ~ obstime,
+                           random = ~ obstime | icustay_id,
+                           data = filter(JM_SBP_long,
+                                         !(icustay_id %in% folds[[fold]])))
+  cv.SBP.cox <- coxph(Surv(Time, death) ~ gender + race +
+                               service  + age,
+                             data = filter(survTable.SBP,
+                                           !(icustay_id %in% folds[[fold]])),
+                             x = TRUE)
+  cv.SBP.JM <- jointModel(cv.SBP.lme,
+                         cv.SBP.cox,
+                         timeVar = 'obstime',
+                         method = 'spline-PH-aGH')
+  # Have it overwrite at each loop in order to conserve space
+  
+  # The model is fit above, now we make predictions.
+  cv.SBP.pred[[fold]] <- ((survfitJM(cv.SBP.JM,
+                            newdata = filter(JM_SBP_long,
+                                             icustay_id %in% folds[[fold]]),
+                            idVar = 'icustay_id',
+                            simulate = FALSE,
+                            survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+  
+
+
+  cv.SBP.val[[fold]] <- data.frame(icustay_id = unique(filter(JM_SBP_long,
+                                                             (icustay_id %in% folds[[fold]]))$icustay_id),
+                                  caseProb = 1 - cv.SBP.pred[[fold]],
+                                  case = 0)
+  
+  cv.SBP.val[[fold]]$case[which(cv.SBP.val[[fold]]$icustay_id %in%
+                                 death72$icustay_id)] <- 1
+  
+  # Get ROC and PR-AUC
+  cv.SBP.roc[fold] <- roc.curve(scores.class0 = cv.SBP.val[[fold]]$caseProb,
+                               weights.class0 = cv.SBP.val[[fold]]$case)$auc
+  cv.SBP.pr[fold] <- pr.curve(scores.class0 = cv.SBP.val[[fold]]$caseProb,
+                             weights.class0 = cv.SBP.val[[fold]]$case)$auc.integral
+}
+
+
+```
+
+We look at AUC summaries for both types of evaluators.
+
+```{r}
+mean(cv.SBP.roc) %>% round(4)
+sd(cv.SBP.roc) %>% round(4)
+
+mean(cv.SBP.pr) %>% round(4)
+sd(cv.SBP.pr) %>% round(4)
+```
+## DBP
+```{r eval = FALSE}
+cv.DBP.lme <- NULL
+cv.DBP.cox <- NULL
+cv.DBP.JM <- NULL
+cv.DBP.pred <- NULL
+cv.DBP.val <- NULL
+cv.DBP.roc <- NULL
+cv.DBP.pr <- NULL
+
+set.seed(1)
+for(fold in 1:k){
+  cv.DBP.lme <- lme(val ~ obstime,
+                           random = ~ obstime | icustay_id,
+                           data = filter(JM_DBP_long,
+                                         !(icustay_id %in% folds[[fold]])))
+  cv.DBP.cox <- coxph(Surv(Time, death) ~ gender + race +
+                               service  + age,
+                             data = filter(survTable.DBP,
+                                           !(icustay_id %in% folds[[fold]])),
+                             x = TRUE)
+  cv.DBP.JM <- jointModel(cv.DBP.lme,
+                         cv.DBP.cox,
+                         timeVar = 'obstime',
+                         method = 'spline-PH-aGH')
+  # Have it overwrite at each loop in order to conserve space
+  
+  # The model is fit above, now we make predictions.
+  cv.DBP.pred[[fold]] <- ((survfitJM(cv.DBP.JM,
+                            newdata = filter(JM_DBP_long,
+                                             icustay_id %in% folds[[fold]]),
+                            idVar = 'icustay_id',
+                            simulate = FALSE,
+                            survTimes = 72)$summaries) %>% unlist)[c(FALSE,TRUE)]
+  
+
+
+  cv.DBP.val[[fold]] <- data.frame(icustay_id = unique(filter(JM_DBP_long,
+                                                             (icustay_id %in% folds[[fold]]))$icustay_id),
+                                  caseProb = 1 - cv.DBP.pred[[fold]],
+                                  case = 0)
+  
+  cv.DBP.val[[fold]]$case[which(cv.DBP.val[[fold]]$icustay_id %in%
+                                 death72$icustay_id)] <- 1
+  
+  # Get ROC and PR-AUC
+  cv.DBP.roc[fold] <- roc.curve(scores.class0 = cv.DBP.val[[fold]]$caseProb,
+                               weights.class0 = cv.DBP.val[[fold]]$case)$auc
+  cv.DBP.pr[fold] <- pr.curve(scores.class0 = cv.DBP.val[[fold]]$caseProb,
+                             weights.class0 = cv.DBP.val[[fold]]$case)$auc.integral
+}
+
+
+```
+
+We look at AUC summaries for both types of evaluators.
+
+```{r}
+mean(cv.DBP.roc) %>% round(4)
+sd(cv.DBP.roc) %>% round(4)
+
+mean(cv.DBP.pr) %>% round(4)
+sd(cv.DBP.pr) %>% round(4)
+```
+
+
+# Save Results
+```{r SaveResult, eval = FALSE}
+
+data.path <- "D:/DISSERTATION ACTION/RAW DATA (PREPROCESSED)/BetterData"
+setwd(data.path)
+
+save(controls, death72,
+     JM_DBP_long, JM_HR_long,
+     JM_O2S_long, JM_RR_long,
+     JM_SBP_long,
+     JM_Static,
+     
+     survTable.DBP, survTable.HR,
+     survTable.O2S, survTable.RR,
+     survTable.SBP,
+     
+     test.HR, test.DBP,
+     test.SBP, test.O2S, test.RR,
+     
+     validation.DBP, validation.HR,
+     validation.RR, validation.O2S, validation.SBP,
+     
+     cox.DBP, cox.HR,
+     cox.RR, cox.SBP,
+     cox.O2S,
+     
+     cv.HR.val, cv.DBP.val,
+     cv.SBP.val, cv.RR.val,
+     cv.O2S.val,
+     
+     cv.HR.pr, cv.DBP.pr,
+     cv.SBP.pr, cv.RR.pr,
+     cv.O2S.pr,
+     
+     cv.HR.roc, cv.DBP.roc,
+     cv.SBP.roc, cv.RR.roc,
+     cv.O2S.roc,
+     
+     jointHR, jointRR,
+     jointO2S,
+     jointSBP, jointDBP,
+     
+     k,
+     
+     lme.DBP, lme.SBP,
+    lme.O2S,
+     lme.RR, lme.HR,
+     
+     ctrlFolds, caseFolds, folds,
+     
+     death24, death48, death72,
+     
+     file = "MIMIC_JM_Results_1.RData")
+
+```
+
+# Summary
+
+We look at the summative cv PR-AUc's and sd's below.
+
+```{r}
+cv.HR.pr %>% mean %>% round(4)
+cv.HR.pr %>% sd %>% round(4)
+
+cv.SBP.pr %>% mean %>% round(4)
+cv.SBP.pr %>% sd %>% round(4)
+
+cv.DBP.pr %>% mean %>% round(4)
+cv.DBP.pr %>% sd %>% round(4)
+
+cv.O2S.pr %>% mean %>% round(4)
+cv.O2S.pr %>% sd %>% round(4)
+
+cv.RR.pr %>% mean %>% round(4)
+cv.RR.pr %>% sd %>% round(4)
+```
+
+Another way we can compare the models is by checking
+
+```{r}
+summary(jointHR)$AIC
+summary(jointRR)$AIC
+summary(jointO2S)$AIC
+summary(jointSBP)$AIC
+summary(jointDBP)$AIC
+
+"BIC"
+summary(jointHR)$BIC
+summary(jointRR)$BIC
+summary(jointO2S)$BIC
+summary(jointSBP)$BIC
+summary(jointDBP)$BIC
+
+```
+
+Note that we want a lower AIC's and BIC's between competing models. All the AIC's and BIC's are pretty high, which might suggest bad fits over all models. This may not be too surprising - using only one longitudinal variable to attempt to predict mortality is most likely not going to be too efficient. The model with the lowest AIC/BIC is the O2S model; however, it also has the second lowest PR-AUC, which we would like to put more stock on due to the presence of partitioning biases and our focus on predictive power.
+
+Of the two highest PR-AUC models (SBP, HR), the one with the lower AIC/BIC is SBP; let's try to see how expansion on the SBP model might look.
+
+# Extensions
+
+For now, let's just build the predictions and shit for 24- and 48- hour survival. Note that the method survfitJM, upon taking in a newdata argument, assumes that a given subject survives up until the last time point for which they have longitudinal measurements. For producing predictions, the newdata would have to be filtered such that it includes only longitudinal measurements with observation times strictly less than the case-time of interest.
+
+
+```{r eval = FALSE}
+
+# 24 hour prediction
+SBP.pred24 <- ((survfitJM(jointRR,
+                         newdata = filter(test.SBP, obstime < 24),
+                        idVar = 'icustay_id',
+                        simulate = FALSE,
+                        survTimes = 24)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+
+
+validation.SBP24 <- data.frame(icustay_id = unique(filter(test.SBP, obstime < 24)$icustay_id),
+                              caseProb = 1 - SBP.pred24,
+                              case = 0)
+
+validation.SBP24$case[which(validation.SBP24$icustay_id %in% death24$icustay_id)] <- 1
+
+
+# 48 hour prediction
+SBP.pred48 <- ((survfitJM(jointRR,
+                         newdata = filter(test.SBP, obstime < 48),
+                        idVar = 'icustay_id',
+                        simulate = FALSE,
+                        survTimes = 48)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+
+
+validation.SBP48 <- data.frame(icustay_id = unique(filter(test.SBP, obstime < 48)$icustay_id),
+                              caseProb = 1 - SBP.pred48,
+                              case = 0)
+
+validation.SBP48$case[which(validation.SBP48$icustay_id %in% death48$icustay_id)] <- 1
+
+
+
+
+```
+
+Let's evaluate the model fits using ROC and PR-ROC of the SBP models
+
+```{r}
+SBP24.roc <- roc.curve(scores.class0 = validation.SBP24$caseProb,
+                      weights.class0 = validation.SBP24$case,
+                      curve = TRUE)
+
+plot(SBP24.roc)
+```
+
+
+```{r}
+SBP24.pr <- pr.curve(scores.class0 = validation.SBP24$caseProb,
+                      weights.class0 = validation.SBP24$case,
+                      curve = TRUE)
+
+plot(SBP24.pr)
+```
+
+Note that the results seem to coincide with intuition that such a model would have great difficulty predicting the 24-hour death due to (1) very low number of cases (compounded by the test set using only 20% of the data, meaning there were only 3 and 12 cases for the 12- and 48- hour studies) present in the data and (2) less longitudinal information. Let's see how the results improve for 48 hours
+
+
+```{r}
+SBP48.roc <- roc.curve(scores.class0 = validation.SBP48$caseProb,
+                      weights.class0 = validation.SBP48$case,
+                      curve = TRUE)
+
+plot(SBP48.roc)
+```
+
+
+```{r}
+SBP48.pr <- pr.curve(scores.class0 = validation.SBP48$caseProb,
+                      weights.class0 = validation.SBP48$case,
+                      curve = TRUE)
+
+plot(SBP48.pr)
+```
+
+
+Let's see how heart rate behaves.
+
+```{r eval = FALSE}
+
+# 24 hour prediction
+HR.pred24 <- ((survfitJM(jointRR,
+                         newdata = filter(test.HR, obstime < 24),
+                        idVar = 'icustay_id',
+                        simulate = FALSE,
+                        survTimes = 24)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+
+
+validation.HR24 <- data.frame(icustay_id = unique(filter(test.HR, obstime < 24)$icustay_id),
+                              caseProb = 1 - HR.pred24,
+                              case = 0)
+
+validation.HR24$case[which(validation.HR24$icustay_id %in% death24$icustay_id)] <- 1
+
+
+
+# 48 hour prediction
+HR.pred48 <- ((survfitJM(jointRR,
+                         newdata = filter(test.HR, obstime < 48),
+                        idVar = 'icustay_id',
+                        simulate = FALSE,
+                        survTimes = 48)$summaries) %>% unlist)[c(FALSE,TRUE)]
+
+
+
+
+validation.HR48 <- data.frame(icustay_id = unique(filter(test.HR, obstime < 48)$icustay_id),
+                              caseProb = 1 - HR.pred48,
+                              case = 0)
+
+validation.HR48$case[which(validation.HR48$icustay_id %in% death48$icustay_id)] <- 1
+
+```
+
+
+
+```{r}
+HR24.roc <- roc.curve(scores.class0 = validation.HR24$caseProb,
+                      weights.class0 = validation.HR24$case,
+                      curve = TRUE)
+
+plot(HR24.roc)
+```
+
+
+```{r}
+HR24.pr <- pr.curve(scores.class0 = validation.HR24$caseProb,
+                      weights.class0 = validation.HR24$case,
+                      curve = TRUE)
+
+plot(HR24.pr)
+```
+
+
+```{r}
+HR48.roc <- roc.curve(scores.class0 = validation.HR48$caseProb,
+                      weights.class0 = validation.HR48$case,
+                      curve = TRUE)
+
+plot(HR48.roc)
+```
+
+
+```{r}
+HR48.pr <- pr.curve(scores.class0 = validation.HR48$caseProb,
+                      weights.class0 = validation.HR48$case,
+                      curve = TRUE)
+
+plot(HR48.pr)
+
+
+```
+
+Tho the figures are still very small, we note that HR had a beter performance predictively than SBP. This just goes to show that BIC and AIC are not the be all end all when it comes to selecting models. From here, let's focus on the Heart Rate models. In particular, let's zero in on a subset of the test set. One of the major advantages of using joint modelling is that the fitted model can be used to predict survival trajectories of individuals. So far, we've been using only point estimates as well; by zeroing in on smaller subsets we are able to use the more computationally expensive methods that involve monte-carlo sampling.
+
+```{r}
+# Saving plots
+par(mfrow=c(1,2))
+plot(HR24.pr, color = FALSE,
+     main = "PR for 24 hours",
+     sub = "AUC = 0.0025", auc.main = FALSE)
+
+plot(HR48.pr, color = FALSE,
+     main = "PR for 48 hours",
+     sub = "AUC = 0.0184", auc.main = FALSE)
+
+
+```
+
+
+# Focus Study on two subject
+
+Medical information suggest that a lower heart rate indicates a healthier individual. Let's see how well such a hypothesis would perform in an isolated test. We're back to 72 hour deaths.
+
+We extract four patients from the test sample, 1 case with the highest average heart rate, and 1 control with the lowest average heart rate.
+
+
+```{r}
+diff.HR <- test.HR %>% group_by(icustay_id) %>%
+  summarise(diffd = diff(val) %>% mean)
+
+diff.HR[order(diff.HR$diffd, decreasing = TRUE),]
+
+
+
+filter(test.HR, icustay_id == 295467)
+
+with(filter(test.HR, icustay_id == 295467),
+     plot(obstime, val, type = "l"))
+
+```
+
+```{r eval = FALSE}
+focus_id <- 295467
+
+focus_id  # cases
+focus_HR <- filter(test.HR, icustay_id == focus_id)
+
+focus_HR
+
+```
+
+We take a look at their longitudinal measurements. Let the cases be demarcated by red lines.
+
+## Focus patient: high HR case
+
+```{r eval = FALSE}
+set.seed(1)
+survfitJM(jointHR,
+          newdata = focus_HR,
+          idVar = 'icustay_id',
+          survTimes = seq(max(filter(focus_HR, icustay_id == focus_id[1])$obstime) + 4, 72, by=4))
+```
+
+Though the survival probabilities seen later are still quite high, there is some difference (magnitudes in the 0.001's scale) in the overall survival probability. Let's take a look at how the survival probabilities evolved as more longitudinal data was put in. (We zoom in to the first 24 hours of information)
+
+```{r eval = FALSE}
+survPred_f <- vector("list", nrow(focus_HR))
+for(i in 1:nrow(focus_HR)){
+  set.seed(1)
+  survPred_f[[i]] <- survfitJM(jointHR,
+                                newdata = focus_HR[1:i,],
+                                idVar = 'icustay_id')
+}
+
+survPred_f1[[1]]
+
+survPred_f1[[5]]
+
+survPred_f1[[7]]
+
+survPred_f1[[13]]
+```
+
+```{r}
+par(mfrow = c(2,2))
+for(i in c(1, 5, 7, 13)){
+  plot(survPred_f1[[i]],
+     estimator = "mean",
+     include.y = TRUE,
+     col = "black",
+     main = paste("Data up to:", round(survPred_f1[[i]]$last.time, 0), "hrs."),
+     ylab2 = "HR", ylab = "Survival", cex.axis.z = 0.7)
+}
+
+focus_id
+```
+
+What we end up with is that the additional information isn't really changing the survival probability. This is likely still to be a function of how the dataset is: low prevalence, and the fact that HR isn't really moving, at least, not on average.
+
+```{r}
+help(survfitJM)
+```
+
+
+## Focus patient: low HR control
+```{r eval = FALSE}
+set.seed(1)
+survfitJM(jointHR,
+          newdata = filter(focus_HR, icustay_id == focus_id[2]),
+          idVar = 'icustay_id',
+          survTimes = seq(max(filter(focus_HR, icustay_id == focus_id[2])$obstime) + 4, 72, by=4))
+```
+
+```{r eval = FALSE}
+survPred_f2 <- vector("list", nrow(focus2))
+for(i in 1:nrow(focus2)){
+  set.seed(1)
+  survPred_f2[[i]] <- survfitJM(jointHR,
+                                newdata = focus2[1:i,],
+                                idVar = 'icustay_id')
+}
+```
+
+```{r}
+for(i in c(1, 4, 5, 11)){
+  plot(survPred_f1[[i]],
+     estimator = "mean",
+     include.y = TRUE,
+     col = "black",
+     main = paste("Data up to:", round(survPred_f1[[i]]$last.time, 0), "hrs."))
+}
+```
+
+The two focus cases shown, while able to show the capabilities of joint modelling, don't really do much to show that HR is predictive. This is further compounded by the fact that the effect size of HR is very small, and that overall, the models aren't that great of fits anyway.
+
+
+```{r eval = FALSE}
+data.path <- "D:/DISSERTATION ACTION/RAW DATA (PREPROCESSED)/BetterData"
+setwd(data.path)
+
+save(SBP.pred24, SBP.pred48,
+      validation.SBP48,
+      validation.SBP24,
+
+      HR.pred24, HR.pred48,
+      validation.HR24,
+      validation.HR48,
+
+      focus_id, focus_HR,
+
+      survPred_f1, survPred_f2,
+     
+     file = "MIMIC_JM_Results_2.RData")
+
+```
+
+# Further extensions
+
+We now see how the results and predictive power changes based on two modifications:
+
+1. Letting age be a covariate in the linear mixed effect model for heart rate
+2. Letting the baseline risk be stratified based on sex
+
+
+# Age as covariates
+```{r eval = FALSE}
+# We work with the training data first, we use most default settings for most of this
+  set.seed(1)
+  lme.HRe1 <- lme(val ~ obstime + age,
+                random = ~ obstime | icustay_id,
+                data = filter(JM_HR_long,  # Get only those in the training set
+                              icustay_id %in% train.id))
+
+  # Fit the joint model
+  
+  jointHRe1 <- jointModel(lme.HRe1,
+                          cox.HR,
+                          timeVar = 'obstime',
+                          method = 'spline-PH-aGH')
+  # We select the smoother spline method for baseline risk.
+```
+
+
+```{r}
+summary(lme.HRe1)
+```
+
+```{r}
+summary(jointHRe1)
+```
+
+Note that the strength of the association is roughly the same! (1.05x)
+
+# Stratified by sex
+
+```{r eval = FALSE}
+set.seed(1)
+  # lme.HRe2 <- lme(val ~ obstime + (obstime + I(obstime^2)),
+  #               random = ~ obstime + I(obstime) | icustay_id,
+  #              data = filter(JM_HR_long,  # Get only those in the training set
+  #                            icustay_id %in% train.id))
+  
+  # We specify all our static variables
+  cox.HRe2 <- coxph(Surv(Time, death) ~ race + service + age + strata(gender),
+                  data = filter(survTable.HR,
+                                icustay_id %in% train.id),
+                  x = TRUE)
+  
+  # Fit the joint model
+  
+  jointHRe2 <- jointModel(lme.HR,  # is the *(obstime in e2 necessary)
+                        cox.HRe2,
+                        timeVar = 'obstime',
+                        method = 'spline-PH-aGH')
+```
+
+
+```{r}
+summary(cox.HRe2)
+```
+
+```{r}
+summary(jointHRe2)
+```
+
+While the differences in each part of the spline basis functions aren't too great, they all come out as significant.
+
+
+# Assumption Validation
+
+We take a look at the residuals of the basic HR model to check the assumptions of the model (conitional error normal and homoscedastic, marginal to check the specifications in the mean structure). In particular, for the LME, we assumed a linear relationship between HR and time, and in the survival, we used a spline function.
+
+Some basic residuals are given by:
+
+```{r}
+par(mfrow = c(1,2))
+plot(jointHR, pch = '.',
+     which = 1:2)
+```
+
+There seem to be some issues regarding homoscedasticity (note how there's less error on the ends), and the QQ shape is not particularly convincing. Let's see if there modified ones are any different
+
+For age as a covariate of HR:
+```{r}
+par(mfrow = c(2,2))
+plot(jointHRe1, pch = '.')
+```
+
+
+For sex as a stratifier for the baseline hazard:
+```{r}
+par(mfrow = c(2,2))
+plot(jointHRe2, pch = '.')
+```
+
+Note how despite stratifying, the marginal survivals of both groups (red and black) are nearly the same (to verify: handling which group is black which is red).
+
+
+```{r eval = FALSE}
+data.path <- "D:/DISSERTATION ACTION/RAW DATA (PREPROCESSED)/BetterData"
+setwd(data.path)
+
+save(test.id, train.id,
+     lme.HRe1, lme.HRe2,
+     cox.HRe2,
+     
+     jointHRe1, jointHRe2,
+     
+     file = "MIMIC_JM_Results_3.RData")
+
+```
+
+
+```{r}
+plotResid <- function(x, y, col.loess = 'black', ...){
+  plot(x, y, ...)
+  lines(lowess(x,y), col = col.loess, lwd = 2)
+  abline(h = 0, lty = 3, col = 'grey', lwd = 2)
+}
+```
+
+```{r}
+martRes <- residuals(jointHR, process = 'Event')
+mi.t <- fitted(jointHR, process = 'Longitudinal',
+               type = 'EventTime')
+
+martRes %>% abs %>% sort(decreasing = TRUE)
+
+plotResid(mi.t, martRes, col.loess = 'grey62',
+          ylab = 'Martingal Residuals',
+          xlab = 'Fitted Values on HR',
+          pch = '.')
+
+```
+
+```{r}
+martResSub <- residuals(jointHR, process = 'Event')
+mi.t <- fitted(jointHR, process = 'Longitudinal',
+               type = 'EventTime')
+
+martRes %>% abs %>% sort(decreasing = TRUE)
+
+plotResid(mi.t, martRes, col.loess = 'grey62',
+          ylab = 'Martingal Residuals',
+          xlab = 'Fitted Values on HR',
+          pch = '.')
+
+```
+
+
+```{r}
+plot(jointlogHR)
+```
+
+
+
+
+# Other stuff
+
+```{r eval=FALSE}
+
+# run while logreg workspace open
+filter(Static_Cohort, icustay_id %in% data$icustay_id)$age.x %>% mean %>% round(2)
+```
+
+
